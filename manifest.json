@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "xPoster",
   "description": "A refined Markdown publishing console for X Articles.",
-  "version": "0.1.39",
+  "version": "0.1.40",
   "minimum_chrome_version": "116",
   "action": {
     "default_title": "xPoster",
@@ -25,6 +25,7 @@
         "https://twitter.com/*"
       ],
       "js": [
+        "src/security.js",
         "src/shared.js",
         "src/content.js"
       ],
@@ -37,6 +38,7 @@
         "https://twitter.com/*"
       ],
       "js": [
+        "src/security-main.js",
         "src/main-world.js"
       ],
       "run_at": "document_idle",
@@ -51,7 +53,8 @@
   "permissions": [
     "storage",
     "sidePanel",
-    "tabs"
+    "tabs",
+    "alarms"
   ],
   "icons": {
     "16": "assets/icon-16.png",
@@ -73,5 +76,8 @@
         "https://twitter.com/*"
       ]
     }
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
   ]
 }

@@ -1,0 +1,184 @@
+// 由统一 run_node.sh 调用；仅本机扩展和模拟站点，不访问真实 X 账号。
+const { createRequire } = require('node:module');
+const { chromium } = createRequire('/home/codex/dev/tools/playwright-global/package.json')('playwright');
+const fs = require('node:fs');
+const path = require('node:path');
+const assert = require('node:assert/strict');
+const root = path.resolve(__dirname, '..');
+const version = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8')).version;
+(async () => {
+ const context = await chromium.launchPersistentContext(fs.mkdtempSync(path.join(root, 'dist', `security-profile-${version}-`)), { channel: 'chromium', headless: true, args: [`--disable-extensions-except=${root}`, `--load-extension=${root}`, '--no-sandbox'] });
+ const results = []; results.push = function(value) { console.log(value); return Array.prototype.push.call(this, value); }; const watchdog = setTimeout(() => { console.error(results); process.exit(1); }, 90000);
+ try {
+  const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker');
+  const id = new URL(worker.url()).host;
+  const page = await context.newPage(); const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  await page.goto(`chrome-extension://${id}/sidepanel.html`);
+  await page.locator('#autoSaveDraft').waitFor();
+  await page.locator('#autoSaveDraft').check();
+  await page.locator('#markdown').fill('# 安全回归草稿\n\n正文不可出现在诊断导出');
+  await page.waitForTimeout(900);
+  const saved = await worker.evaluate(async () => (await chrome.storage.local.get('xposter_sidepanel_draft')).xposter_sidepanel_draft);
+  assert.ok(saved.text.includes('安全回归草稿')); assert.ok(saved.expires > Date.now());
+  await page.reload(); await page.locator('#autoSaveDraft').waitFor();
+  assert.ok((await page.locator('#markdown').inputValue()).includes('安全回归草稿'));
+  results.push('草稿防抖保存、期限字段和恢复');
+  await page.locator('#autoSaveDraft').uncheck(); await page.locator('#markdown').fill('# 禁止保存'); await page.waitForTimeout(900);
+  assert.equal(await worker.evaluate(async () => (await chrome.storage.local.get('xposter_sidepanel_draft')).xposter_sidepanel_draft), undefined);
+  results.push('关闭自动保存会删除草稿且输入不再保存');
+
+  const imageResult = await page.evaluate(async (base64) => {
+   const s = xPosterSecurity;
+   const image = s.data(`data:image/png;base64,${base64}`);
+   await s.validate(image.bytes, image.mime);
+   let bad = false; const broken = image.bytes.slice(0, 24);
+   try { await s.validate(broken, 'image/png'); } catch { bad = true; }
+   return { good: true, truncatedRejected: bad };
+  }, fs.readFileSync(path.join(root, 'assets/icon-16.png')).toString('base64'));
+  assert.deepEqual(imageResult, { good: true, truncatedRejected: true }); results.push('PNG 真实浏览器解码成功，截断图片拒绝');
+  const local = await page.evaluate(async base64 => {
+   const dir = await navigator.storage.getDirectory();
+   const file = await dir.getFileHandle('valid.png', { create: true }); const writer = await file.createWritable();
+   await writer.write(Uint8Array.from(atob(base64), c => c.charCodeAt(0))); await writer.close();
+   await xPosterShared.saveVaultHandle(dir);
+   const payload = await xPosterShared.resolveLocalImage('./valid.png');
+   return { ok: payload.ok, mime: payload.mime, bytes: payload.bytes };
+  }, fs.readFileSync(path.join(root, 'assets/icon-16.png')).toString('base64'));
+  assert.equal(local.ok, true); results.push('扩展源持久化 OPFS 测试句柄并读取正常相对图片');
+  await context.route('https://x.com/**', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: '<html><body><div class="public-DraftEditor-content" contenteditable="true" style="width:500px;height:200px">原正文</div></body></html>' }));
+  const x = await context.newPage(); await x.goto('https://x.com/compose/articles/edit/123');
+  await x.waitForTimeout(800);
+  await x.addScriptTag({ path: path.join(root, 'src/shared.js') });
+  assert.equal(await x.evaluate(async () => { try { await xPosterShared.saveVaultHandle(await navigator.storage.getDirectory()); return false; } catch { return true; } }), true);
+  results.push('X 源实际保存目录句柄被可信源检查拒绝');
+  await x.addScriptTag({ path: path.join(root, 'scripts/draft-fixture.js') });
+  async function install(options = {}) { await x.evaluate(options => testDraft.install('原正文', options), options); }
+  async function importText(markdown) {
+   x.once('dialog', dialog => dialog.accept());
+   return page.evaluate(async markdown => {
+    const [tab] = await chrome.tabs.query({ url: 'https://x.com/*' });
+    return chrome.tabs.sendMessage(tab.id, { type: 'xposter:import-markdown', markdown, targetUrl: tab.url, localFiles: {} });
+   }, markdown);
+  }
+  await install();
+  await page.locator('#markdown').fill('侧栏按钮正常导入');
+  await page.locator('#runPreflight').evaluate(button => button.click());
+  await page.waitForFunction(() => !document.querySelector('#runPreflight').disabled);
+  assert.equal(await page.locator('#importDraft').isDisabled(), false);
+  x.once('dialog', dialog => dialog.accept());
+  await page.locator('#importDraft').evaluate(button => button.click());
+  await x.waitForFunction(() => document.querySelector('.public-DraftEditor-content').textContent === '侧栏按钮正常导入');
+  await page.waitForFunction(() => !document.querySelector('#importDraft').disabled);
+  results.push('侧栏真实检查与导入按钮完成纯文本导入（模拟 Draft）');
+  await install();
+  const plain = await importText('正常纯文本导入');
+  assert.equal(plain.ok, true, JSON.stringify(plain));
+  assert.equal(await x.locator('.public-DraftEditor-content').innerText(), '正常纯文本导入');
+  results.push('真实扩展桥接运行结构化纯文本导入成功（模拟不可变 Draft）');
+  await x.evaluate(() => testDraft.install(''));
+  const empty = await importText('空白文章首次导入');
+  assert.equal(empty.ok, true, JSON.stringify(empty));
+  assert.equal(await x.locator('.public-DraftEditor-content').innerText(), '空白文章首次导入');
+  results.push('空白文章安全准备字符样本并成功导入（模拟 Draft，真实 execCommand）');
+  await install();
+  await x.evaluate(() => { const input = document.createElement('input'); input.id = 'unrelated'; document.body.appendChild(input); });
+  const pendingPlain = importText('无关按键不取消');
+  await x.waitForFunction(() => document.querySelector('.public-DraftEditor-content').textContent === '无关按键不取消');
+  await x.locator('#unrelated').focus(); await x.keyboard.press('ArrowRight');
+  await x.evaluate(() => history.replaceState({ test: true }, '', location.href));
+  assert.equal((await pendingPlain).ok, true);
+  results.push('其他输入框真实 ArrowRight 与同 URL replaceState 不误取消');
+  const imageMarkdown = '正常图片流程\n\n![](data:image/png;base64,' + fs.readFileSync(path.join(root, 'assets/icon-16.png')).toString('base64') + ')';
+  await install();
+  const picture = await importText(imageMarkdown);
+  assert.equal(picture.ok, true, JSON.stringify(picture)); assert.equal(picture.summary.main.imgOk, 1);
+  results.push('正常图片桥接、异步 MEDIA 回调、收尾成功（模拟上传）');
+  await install({ uploadDelay: 1300 });
+  const pendingImage = importText(imageMarkdown);
+  await x.waitForFunction(() => window.fixtureUploading);
+  const busyClear = await page.evaluate(async () => { const [tab] = await chrome.tabs.query({ url: 'https://x.com/*' }); return chrome.tabs.sendMessage(tab.id, { type: 'xposter:clear-records' }); });
+  assert.equal(busyClear.ok, false);
+  await x.evaluate(() => testDraft.external('程序更新的新正文'));
+  const changed = await pendingImage;
+  assert.equal(changed.ok, false); assert.match(changed.error, /版本/);
+  assert.ok((await x.locator('.public-DraftEditor-content').innerText()).includes('程序更新的新正文'));
+  results.push('异步上传期间程序更改 Draft 正文拒绝后续写入；运行中清空明确失败');
+  await x.waitForTimeout(1500);
+  x.once('dialog', dialog => dialog.accept());
+  const recovered = await page.evaluate(async () => { const [tab] = await chrome.tabs.query({ url: 'https://x.com/*' }); return chrome.tabs.sendMessage(tab.id, { type: 'xposter:restore' }); });
+  assert.equal(recovered.ok, true); assert.equal(await x.locator('.public-DraftEditor-content').innerText(), '原正文');
+  results.push('失败后恢复原正文成功，并保留可反向恢复的当前状态');
+  await install({ uploadDelay: 1300 });
+  const pendingNavigation = importText(imageMarkdown);
+  await x.waitForFunction(() => window.fixtureUploading);
+  await x.evaluate(() => history.pushState({}, '', '/compose/articles/edit/124'));
+  assert.equal((await pendingNavigation).ok, false);
+  await x.waitForTimeout(1500);
+  await x.evaluate(() => history.replaceState({}, '', '/compose/articles/edit/123'));
+  results.push('实际文章导航变化取消异步导入');
+  await install();
+  x.once('dialog', dialog => dialog.dismiss());
+  const cancelled = await page.evaluate(async () => { const [tab] = await chrome.tabs.query({ url: 'https://x.com/*' }); return chrome.tabs.sendMessage(tab.id, { type: 'xposter:import-markdown', markdown: '不应写入', targetUrl: tab.url, localFiles: {} }); });
+  assert.equal(cancelled.ok, false); assert.match(cancelled.error, /取消/);
+  results.push('取消整体替换确认保留正文');
+  const targetChange = await page.evaluate(async () => {
+   const [tab] = await chrome.tabs.query({ url: 'https://x.com/*' });
+   return chrome.tabs.sendMessage(tab.id, { type: 'xposter:import-markdown', markdown: '# 新正文', targetUrl: 'https://x.com/compose/articles/edit/999', localFiles: {} });
+  });
+  assert.equal(targetChange.ok, false); assert.equal(await x.locator('.public-DraftEditor-content').innerText(), '原正文');
+  results.push('目标 URL 不符拒绝导入且原正文保留');
+  await page.evaluate(() => {
+   window.permissionFixture = { granted: new Set(), allow: false, requests: [], probes: 0 };
+   chrome.permissions.contains = async ({ origins }) => origins.every(origin => permissionFixture.granted.has(origin));
+   chrome.permissions.getAll = async () => ({ origins: [...permissionFixture.granted] });
+   chrome.permissions.request = async ({ origins }) => { permissionFixture.requests.push(origins); if (permissionFixture.allow) origins.forEach(origin => permissionFixture.granted.add(origin)); return permissionFixture.allow; };
+   const original = chrome.runtime.sendMessage.bind(chrome.runtime);
+   chrome.runtime.sendMessage = async message => { if (message.type === 'xposter:probe-image') { permissionFixture.probes++; return { ok: true, bytes: 100, mime: 'image/png', fileName: 'image.png' }; } return original(message); };
+  });
+  await page.locator('#markdown').fill('无图草稿');
+  await page.locator('#runPreflight').evaluate(button => button.click()); await page.waitForTimeout(300);
+  assert.equal(await page.evaluate(() => permissionFixture.requests.length), 0);
+  await page.locator('#markdown').fill('![](https://images.real.site/a.png)\n\n![](https://cdn.real.site/b.png)');
+  await page.locator('#checkRemoteImages').evaluate(button => button.click()); await page.waitForTimeout(250);
+  assert.equal(await page.evaluate(() => permissionFixture.requests.length), 0);
+  assert.equal(await page.evaluate(() => permissionFixture.probes), 0);
+  await page.locator('#allowRemoteImages').evaluate(button => button.click()); await page.waitForTimeout(1000);
+  assert.equal(await page.evaluate(() => permissionFixture.requests.length), 1);
+  assert.equal(await page.evaluate(() => permissionFixture.granted.size), 0);
+  await page.evaluate(() => { permissionFixture.allow = true; });
+  await page.locator('#allowRemoteImages').evaluate(button => button.click()); await page.waitForTimeout(700);
+  assert.equal(await page.evaluate(() => permissionFixture.granted.size), 1);
+  await page.locator('#allowRemoteImages').evaluate(button => button.click()); await page.waitForTimeout(700);
+  assert.equal(await page.evaluate(() => permissionFixture.granted.size), 2);
+  assert.ok(await page.evaluate(() => permissionFixture.requests.every(request => request.length === 1)));
+  const priorProbes = await page.evaluate(() => permissionFixture.probes);
+  await page.locator('#checkRemoteImages').evaluate(button => button.click()); await page.waitForTimeout(700);
+  assert.ok(await page.evaluate(prior => permissionFixture.probes > prior, priorProbes));
+  await page.evaluate(() => permissionFixture.granted.clear());
+  const beforeRevoked = await page.evaluate(() => permissionFixture.probes);
+  await page.locator('#checkRemoteImages').evaluate(button => button.click()); await page.waitForTimeout(400);
+  assert.equal(await page.evaluate(() => permissionFixture.probes), beforeRevoked);
+  results.push('真实侧栏入口：无图、未授权、拒绝、两个图源逐站授权、重新检查、撤权后阻止（授权与探测 API 模拟）');
+  await page.evaluate(() => {
+   const send = chrome.tabs.sendMessage.bind(chrome.tabs);
+   chrome.tabs.sendMessage = async (id, message) => {
+    if (message.type === 'xposter:diagnostics') { window.holdingDiagnostics = true; return new Promise(resolve => { window.releaseDiagnostics = () => resolve({ ok: true }); }); }
+    return send(id, message);
+   };
+  });
+  await page.locator('#runPreflight').evaluate(button => button.click());
+  await page.waitForFunction(() => window.holdingDiagnostics);
+  await page.locator('#clearDraft').click(); await page.waitForTimeout(200);
+  await page.evaluate(() => releaseDiagnostics());
+  await page.waitForTimeout(200);
+  assert.equal(await page.locator('#evidenceText').innerText(), '');
+  assert.equal(await page.locator('#runPreflight').isDisabled(), false);
+  results.push('清空代次丢弃迟到的检查结果，不重建证据且检查按钮恢复');
+  assert.equal(await worker.evaluate(async () => (await chrome.storage.local.get('xposter_sidepanel_draft')).xposter_sidepanel_draft), undefined);
+  assert.deepEqual(errors, []);
+  results.push('清除草稿记录，无侧边栏 pageerror');
+  fs.writeFileSync(path.join(root, 'dist', `安全浏览器回归-${version}.json`), JSON.stringify({ version, engine: 'Playwright Chromium', results, errors, limits: '未登录 X；未验证真实上传、GraphQL 或原生目录选择器授权生命周期' }, null, 2) + '\n', 'utf8');
+  console.log(JSON.stringify(results, null, 2));
+ } finally { clearTimeout(watchdog); await context.close(); }
+})().catch(error => { console.error(error); process.exitCode = 1; });

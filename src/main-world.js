@@ -1,14 +1,69 @@
 (() => {
+  const security = globalThis.xPosterSecurity;
+  let activeSession = null;
+  let inputRevision = 0;
+  const snapshots = new Map();
+  const contextTokens = new Map();
+  // 只将实际目标正文变化视为冲突；光标、其他输入框和同 URL 的历史状态更新不算正文编辑。
+  function blockRecord(content, block) {
+    const entities = [];
+    const chars = block.getCharacterList();
+    chars.forEach(character => { const key = character.getEntity?.(); if (key != null && !entities.some(item => item[0] === key)) { const entity = content.getEntity(key); entities.push([key, entity.getType(), activeSession?.ownedMedia?.has(key) ? "本次上传媒体状态" : entity.getData()]); } });
+    return JSON.stringify({ type: block.getType(), text: block.getText(), depth: block.getDepth?.() || 0, data: block.getData?.()?.toJS?.() || {}, chars: chars.toJS?.() || [], entities });
+  }
+  function contentRecords(content) { const records = new Map(); content.getBlockMap().forEach((block, key) => records.set(key, blockRecord(content, block))); return records; }
+  function sameRecords(left, right) { return left.size === right.size && [...left].every(([key, value], i) => [...right.keys()][i] === key && right.get(key) === value); }
+  function acceptContent(node, content) {
+    activeSession.node = node; activeSession.content = content; activeSession.records = contentRecords(content);
+  }
+  function allowedUpload(content, pending) {
+    const current = contentRecords(content); let media = 0, blanks = 0;
+    for (const [key, record] of pending.records) {
+      if (key !== pending.markerKey && current.get(key) !== record) return false;
+    }
+    const stable = [...pending.records.keys()].filter(key => key !== pending.markerKey);
+    const present = [...current.keys()].filter(key => pending.records.has(key) && key !== pending.markerKey);
+    if (JSON.stringify(stable) !== JSON.stringify(present)) return false;
+    let valid = true;
+    content.getBlockMap().forEach((block, key) => {
+      if (pending.records.has(key) && key !== pending.markerKey) return;
+      if (key === pending.markerKey && current.get(key) === pending.records.get(key)) return;
+      if (block.getType() === "atomic") {
+        let hasMedia = false;
+        block.getCharacterList().forEach(character => { const entityKey = character.getEntity?.(); if (entityKey != null && content.getEntity(entityKey).getType() === "MEDIA") hasMedia = true; });
+        if (!hasMedia || ++media > 1) valid = false;
+      } else if (!block.getText().trim() && block.getType() === "unstyled" && ++blanks <= 2) { /* X 上传可新增空段落。 */ }
+      else valid = false;
+    });
+    if (!current.has(pending.markerKey) && !media) return false;
+    return valid;
+  }
+  for (const method of ["pushState", "replaceState"]) { const original = history[method]; history[method] = function (...args) { const before = location.href; const result = original.apply(this, args); if (location.href !== before) inputRevision++; return result; }; }
+  window.addEventListener("popstate", () => { if (activeSession && location.href !== activeSession.url) inputRevision++; });
+  function assertContext() {
+    if (!activeSession) return;
+    if (location.href !== activeSession.url || inputRevision !== activeSession.revision || Date.now() > activeSession.expires) throw new Error("文章或导航上下文已变化，导入取消");
+    if (!activeSession.node) return;
+    const node = findDraftStateNode();
+    if (node !== activeSession.node || findEditorElement() !== activeSession.element) throw new Error("目标编辑器已变化，导入取消");
+    const content = node.props.editorState.getCurrentContent();
+    // 即使没有 trusted 输入事件，程序替换正文也必须核对内容；选择状态变化可保留。
+    const records = contentRecords(content);
+    const seeded = activeSession.seed && content.getPlainText?.() === "x" && records.size === 1 && content.getBlockMap().find(block => block.getType() === "unstyled" && block.getText() === "x");
+    if (!sameRecords(records, activeSession.records) && !seeded && !(activeSession.upload && allowedUpload(content, activeSession.upload))) throw new Error("正文版本已变化，导入取消");
+    activeSession.content = content; activeSession.records = records;
+  }
+  function changeDraft(node, state) { assertContext(); node.props.onChange(state); acceptContent(node, state.getCurrentContent()); }
   const LOG = "[xPoster MAIN]";
   const CHANNEL_TO_MAIN = "xposter";
   const CHANNEL_FROM_MAIN = "xposter-main";
   const EDITOR_SELECTOR =
     "[data-contents='true'] [contenteditable='true'], [contenteditable='true'][role='textbox'], [contenteditable='true'].public-DraftEditor-content, [contenteditable='true']";
 
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const sleep = async (ms) => { await new Promise(resolve => setTimeout(resolve, ms)); assertContext(); };
 
   function post(kind, payload = {}) {
-    window.postMessage({ source: CHANNEL_FROM_MAIN, kind, ...payload }, "*");
+    window.postMessage({ source: CHANNEL_FROM_MAIN, kind, sessionId: activeSession?.id, ...payload }, location.origin);
   }
 
   function progress(text, level = "work") {
@@ -26,12 +81,12 @@
         reject(new Error("Prepared image data did not arrive"));
       }, timeoutMs);
       const listener = (event) => {
-        if (event.source !== window || event.data?.source !== CHANNEL_TO_MAIN) return;
+        if (event.source !== window || event.origin !== location.origin || event.data?.source !== CHANNEL_TO_MAIN) return;
         const message = event.data;
-        if (message.kind !== "file-response" || message.requestId !== requestId) return;
+        if (message.kind !== "file-response" || message.requestId !== requestId || message.sessionId !== activeSession?.id) return;
         clearTimeout(timeout);
         window.removeEventListener("message", listener);
-        if (message.ok && message.file?.base64) resolve(message.file);
+        if (message.ok && typeof message.file?.base64 === "string" && message.file.base64.length <= Math.ceil(security.MAX_BYTES * 4 / 3) && /^image\/(png|jpeg|gif|webp)$/.test(message.file.mime)) { try { assertContext(); resolve(message.file); } catch (error) { reject(error); } }
         else reject(new Error(message.error || "Prepared image data was not available"));
       };
       window.addEventListener("message", listener);
@@ -141,14 +196,18 @@
     if (!editor) return draftNode;
 
     editor.focus();
+    const before = draftNode.props.editorState.getCurrentContent();
+    if ((before.getPlainText?.() || "").trim()) throw new Error("现有正文缺少可用字符样本，已停止替换");
+    activeSession.seed = true;
     document.execCommand("insertText", false, "x");
 
     const deadline = Date.now() + 1600;
     while (Date.now() < deadline) {
       await sleep(80);
       const latestNode = findDraftStateNode() || draftNode;
-      if (findDraftSampleBlock(latestNode)) return latestNode;
+      if (findDraftSampleBlock(latestNode)) { activeSession.seed = false; return latestNode; }
     }
+    activeSession.seed = false;
     return findDraftStateNode() || draftNode;
   }
 
@@ -181,6 +240,7 @@
       const entityRanges = new Map();
 
       for (const link of block.links || []) {
+        if (!security.safeLink(link.url)) continue;
         const offset = Number(link.offset) || 0;
         const length = Math.max(0, Number(link.length) || 0);
         if (!length || !link.url) continue;
@@ -227,7 +287,7 @@
       .set("selectionAfter", selection);
     let nextEditorState = EditorState.push(editorState, nextState, "insert-fragment");
     nextEditorState = EditorState.moveSelectionToEnd(nextEditorState);
-    draftNode.props.onChange(nextEditorState);
+    changeDraft(draftNode, nextEditorState);
     return { ok: true, blocks: createdKeys.length };
   }
 
@@ -338,7 +398,7 @@
       const nextContent = contentState.set("selectionBefore", selection).set("selectionAfter", selection);
       let nextEditorState = EditorState.push(editorState, nextContent, "insert-fragment");
       nextEditorState = EditorState.moveSelectionToEnd(nextEditorState);
-      draftNode.props.onChange(nextEditorState);
+      changeDraft(draftNode, nextEditorState);
     }
 
     return { okCount, failCount: errors.length, errors };
@@ -377,7 +437,7 @@
     const blockKey = findMarkerBlock(contentState, marker);
     if (!blockKey) return false;
     const selection = SelectionState.createEmpty(blockKey).merge({ anchorOffset: 0, focusOffset: 0 });
-    draftNode.props.onChange(EditorState.forceSelection(editorState, selection));
+    changeDraft(draftNode, EditorState.forceSelection(editorState, selection));
     return true;
   }
 
@@ -394,6 +454,8 @@
     const preparedFile = await requestPreparedFile(imageOperation);
     const file = base64ToFile(preparedFile.base64, preparedFile.fileName, preparedFile.mime);
 
+    assertContext();
+    activeSession.upload = { markerKey: findMarkerBlock(activeSession.content, imageOperation.marker), records: new Map(activeSession.records) };
     onFilesAdded([file]);
     const deadline = Date.now() + 45000;
     while (Date.now() < deadline) {
@@ -414,17 +476,22 @@
               const data = entity.getData();
               const item = data?.mediaItems?.[0] || data?.media_items?.[0];
               const mediaId = item?.mediaId || item?.media_id || null;
-              found = { entityKey, blockKey, mediaId };
+              if (mediaId) found = { entityKey, blockKey, mediaId };
             } catch {}
           }
         );
       });
       if (found) {
+        assertContext();
+        activeSession.ownedMedia.add(found.entityKey);
+        acceptContent(draftNode, contentState);
+        activeSession.upload = null;
         existingAtomicBlocks.add(found.blockKey);
         return { ok: true, ...found };
       }
     }
 
+    activeSession.upload = null;
     return { ok: false, error: "Timed out waiting for X media upload" };
   }
 
@@ -446,7 +513,7 @@
       .set("blockMap", blockMap.set(blockKey, nextBlock))
       .set("selectionBefore", selection)
       .set("selectionAfter", selection);
-    draftNode.props.onChange(EditorState.push(editorState, nextContent, "change-block-data"));
+    changeDraft(draftNode, EditorState.push(editorState, nextContent, "change-block-data"));
     return true;
   }
 
@@ -528,7 +595,7 @@
       .set("selectionAfter", selection);
     let nextEditorState = EditorState.push(editorState, nextContent, "remove-range");
     nextEditorState = EditorState.moveSelectionToEnd(nextEditorState);
-    draftNode.props.onChange(nextEditorState);
+    changeDraft(draftNode, nextEditorState);
     return { moved: moves.size, missing };
   }
 
@@ -554,14 +621,14 @@
       .set("selectionAfter", selection);
     let nextEditorState = EditorState.push(editorState, nextContent, "remove-range");
     nextEditorState = EditorState.moveSelectionToEnd(nextEditorState);
-    draftNode.props.onChange(nextEditorState);
+    changeDraft(draftNode, nextEditorState);
     return toDelete.length;
   }
 
   function kickRender(draftNode) {
     try {
       const EditorState = draftNode.props.editorState.constructor;
-      draftNode.props.onChange(EditorState.moveSelectionToEnd(draftNode.props.editorState));
+      changeDraft(draftNode, EditorState.moveSelectionToEnd(draftNode.props.editorState));
     } catch (error) {
       console.warn(LOG, "render kick failed", error);
     }
@@ -588,6 +655,7 @@
   }
 
   async function xGraphql(queryId, operationName, body) {
+    assertContext();
     const response = await fetch(`https://x.com/i/api/graphql/${queryId}/${operationName}`, {
       method: "POST",
       credentials: "include",
@@ -604,7 +672,9 @@
     try {
       text = await response.text();
     } catch {}
-    return { ok: response.ok, status: response.status, body: text.slice(0, 240) };
+    assertContext();
+    let json = null; try { json = JSON.parse(text); } catch {}
+    return { ok: response.ok && security.graphql(json, body.variables.articleEntityId, operationName, operationName === "ArticleEntityUpdateTitle" ? body.variables.title : body.variables.coverMedia.media_id), status: response.status };
   }
 
   function updateTitleGraphql(articleId, title) {
@@ -643,7 +713,7 @@
       .set("selectionAfter", selection);
     let nextEditorState = EditorState.push(editorState, nextContent, "remove-range");
     nextEditorState = EditorState.moveSelectionToEnd(nextEditorState);
-    draftNode.props.onChange(nextEditorState);
+    changeDraft(draftNode, nextEditorState);
     return { ok: true };
   }
 
@@ -703,12 +773,20 @@
     let draftNode = findDraftStateNode();
     if (!draftNode) throw new Error("X Draft.js editor was not reachable");
     const articleId = articleIdFromUrl();
+    assertContext();
+    if (payload.targetUrl !== location.href || payload.expectedText !== (findEditorElement()?.textContent || "")) throw new Error("目标正文版本不一致");
+    const context = contextTokens.get(payload.contextToken); contextTokens.delete(payload.contextToken);
+    if (!context || context.url !== location.href || context.node !== draftNode || context.element !== findEditorElement() || !sameRecords(context.records, contentRecords(draftNode.props.editorState.getCurrentContent())) || context.revision !== inputRevision || context.expires < Date.now()) throw new Error("正文版本或导航上下文已变化");
+    activeSession.element = findEditorElement();
+    acceptContent(draftNode, draftNode.props.editorState.getCurrentContent());
+    snapshots.set(location.href, { state: draftNode.props.editorState, node: draftNode, element: findEditorElement(), savedAt: Date.now() });
+    while (snapshots.size > 3) snapshots.delete(snapshots.keys().next().value);
     progress("Pasting structured Markdown...");
     draftNode = await ensureDraftCharacterSample(draftNode);
     const writeResult = writeDraftBlocks(draftNode, payload.blocks);
     if (!writeResult.ok) {
       console.warn(LOG, "structured block write failed; falling back to paste", writeResult.error);
-      pasteHtml(payload.html, payload.plain);
+      throw new Error("结构化写入失败，已保留恢复快照：" + writeResult.error);
     }
     draftNode = await waitForDraftMarkers(payload.markerPrefix, (payload.plan || []).length);
     if (!draftNode) throw new Error("X Draft.js editor was not reachable after writing Markdown");
@@ -838,14 +916,7 @@
             error: error?.message || String(error)
           }));
           summary.cover.graphql = result;
-          if (result.ok) {
-            await sleep(600);
-            const deleteResult = deleteBlockByKey(draftNode, coverUpload.blockKey);
-            summary.cover.bodyBlockDeleted = deleteResult;
-            if (!deleteResult.ok) console.warn(LOG, "cover block cleanup failed", deleteResult);
-          } else {
-            console.warn(LOG, "cover update failed", result);
-          }
+          summary.cover.bodyBlockDeleted = { ok: false, skipped: true, reason: "保留正文原图，请确认封面后手动移除" };
         } else {
           summary.cover.skippedReason = "Cover source has no uploaded media match";
           console.warn(LOG, "cover source has no uploaded media match", payload.cover);
@@ -861,16 +932,33 @@
   }
 
   window.addEventListener("message", (event) => {
-    if (event.source !== window || event.data?.source !== CHANNEL_TO_MAIN) return;
+    if (event.source !== window || event.origin !== location.origin || event.data?.source !== CHANNEL_TO_MAIN) return;
+    if (event.data.kind === "capture-context") {
+      if (activeSession || typeof event.data.requestId !== "string" || event.data.requestId.length > 100) return;
+      const node = findDraftStateNode(); const token = crypto.randomUUID();
+      while (contextTokens.size >= 8) contextTokens.delete(contextTokens.keys().next().value);
+      if (node) contextTokens.set(token, { records: contentRecords(node.props.editorState.getCurrentContent()), node, element: findEditorElement(), url: location.href, revision: inputRevision, expires: Date.now() + 5 * 60 * 1000 });
+      post("context", { requestId: event.data.requestId, token: node ? token : null }); return;
+    }
     if (event.data.kind === "ready?") {
       post("ready");
       return;
     }
+    if (event.data.kind === "clear-records") { const ok = !activeSession; if (ok) { snapshots.clear(); contextTokens.clear(); } post("clear-result", { requestId: event.data.requestId, ok }); return; }
+    if (event.data.kind === "restore") {
+      const saved = snapshots.get(location.href); const node = findDraftStateNode();
+      const ok = Boolean(!activeSession && event.data.targetUrl === location.href && saved && node === saved.node && findEditorElement() === saved.element);
+      if (ok) { const current = node.props.editorState; node.props.onChange(saved.state); snapshots.set(location.href, { ...saved, state: current, savedAt: Date.now() }); }
+      post("restore-result", { requestId: event.data.requestId, ok }); return;
+    }
     if (event.data.kind === "run") {
-      runFlow(event.data.payload).catch((error) => {
+      const p = event.data.payload;
+      if (activeSession || typeof event.data.sessionId !== "string" || event.data.sessionId.length > 100 || !p || typeof p.html !== "string" || p.html.length > 4 * 1024 * 1024 || !Array.isArray(p.blocks) || p.blocks.length > 1000 || !Array.isArray(p.plan) || p.plan.length > 30 || p.targetUrl !== location.href || !security.planSchema(p)) return;
+      activeSession = { id: event.data.sessionId, url: location.href, revision: inputRevision, expires: Date.now() + 5 * 60 * 1000, ownedMedia: new Set() };
+      runFlow(p).catch((error) => {
         console.error(LOG, error);
-        post("error", { error: error?.message || String(error), stack: error?.stack || null });
-      });
+        post("error", { error: error?.message || String(error), stack: null });
+      }).finally(() => { activeSession = null; });
       return;
     }
     if (event.data.kind === "diagnostics") {

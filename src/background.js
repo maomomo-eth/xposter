@@ -1,6 +1,8 @@
+import "./security.js";
+const security = globalThis.xPosterSecurity;
 const REMOTE_IMAGE_TIMEOUT_MS = 15000;
 const MAX_IMAGE_BYTES = 16 * 1024 * 1024;
-const REMOTE_IMAGE_RETRY_DELAYS_MS = [0, 500, 1400, 3000, 6000, 10000];
+const REMOTE_IMAGE_RETRY_DELAYS_MS = [0, 500];
 const REMOTE_IMAGE_CACHE_TTL_MS = 10 * 60 * 1000;
 const MAX_REMOTE_IMAGE_CACHE_BYTES = 96 * 1024 * 1024;
 
@@ -12,6 +14,8 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "xposter:draft" && sender.url?.startsWith(chrome.runtime.getURL(""))) { draftOperation(message).then(sendResponse).catch(() => sendResponse({ ok: false, error: "草稿操作失败" })); return true; }
+  if (message?.type === "xposter:clear-cache" && sender.url?.startsWith(chrome.runtime.getURL(""))) { if (activeDownloads || downloadQueue.length) { sendResponse({ ok: false, error: "图片下载正在进行，请稍后清空" }); return false; } remoteImageCache.clear(); remoteImageCacheBytes = 0; sendResponse({ ok: true }); return false; }
   if (message?.type === "xposter:fetch-image") {
     fetchImage(message.url, sender)
       .then(sendResponse)
@@ -107,7 +111,7 @@ async function openArticles() {
 
 async function fetchImage(url, sender = {}) {
   if (!url || typeof url !== "string") return { ok: false, error: "Invalid image URL" };
-  if (url.startsWith("data:")) return parseDataUri(url);
+  if (url.startsWith("data:")) return validatedData(url);
   if (!/^https?:\/\//i.test(url)) return { ok: false, error: "Unsupported image scheme" };
   const permission = await ensureRemoteImagePermission(url, sender);
   if (!permission.ok) return permission;
@@ -117,7 +121,7 @@ async function fetchImage(url, sender = {}) {
 async function probeImage(url, sender = {}) {
   if (!url || typeof url !== "string") return { ok: false, error: "Invalid image URL" };
   if (url.startsWith("data:")) {
-    const parsed = parseDataUri(url);
+    const parsed = await validatedData(url);
     return parsed.ok
       ? { ok: true, mime: parsed.mime, bytes: parsed.bytes || 0, fileName: "image.png" }
       : parsed;
@@ -197,7 +201,14 @@ function isRetryableRemoteImageResult(result) {
   );
 }
 
+let activeDownloads = 0;
+const downloadQueue = [];
 async function readRemoteImagePayload(url) {
+  if (activeDownloads >= 3) { if (downloadQueue.length >= 30) return { ok: false, error: "图片队列已满" }; await new Promise(resolve => downloadQueue.push(resolve)); }
+  else activeDownloads++;
+  try { return await readRemoteImagePayloadInner(url); } finally { const next = downloadQueue.shift(); if (next) next(); else activeDownloads--; }
+}
+async function readRemoteImagePayloadInner(url) {
   const cached = cachedRemoteImage(url);
   if (cached) return cached;
 
@@ -221,11 +232,13 @@ async function fetchRemoteImagePayload(url) {
     const fetched = await fetchRemoteImageResponse(url, controller.signal);
     if (!fetched.ok) return fetched.error;
     const { response, finalUrl, repairedSignedUrl } = fetched;
-    const buffer = await response.arrayBuffer();
+    const bytes = await security.stream(response);
+    const buffer = bytes.buffer;
     if (buffer.byteLength > MAX_IMAGE_BYTES) {
       return { ok: false, error: `Image is too large (${buffer.byteLength} bytes)` };
     }
     const mime = (response.headers.get("content-type") || "").split(";")[0].trim() || guessMime(finalUrl || url);
+    await security.validate(bytes, mime);
     return {
       ok: true,
       base64: arrayBufferToBase64(buffer),
@@ -252,11 +265,12 @@ async function fetchRemoteImageResponse(url, signal) {
   for (let index = 0; index < candidates.length; index += 1) {
     const candidate = candidates[index];
     try {
-      const response = await fetch(candidate.url, {
+      const request = new Request(candidate.url, {
         signal,
-        redirect: "follow",
+        redirect: "error",
         credentials: "omit"
       });
+      const response = await fetch(request);
       if (response.ok) {
         return {
           ok: true,
@@ -333,7 +347,7 @@ function remoteImageFetchError(url, reason, status = null, details = {}) {
   try {
     origin = new URL(url).origin;
   } catch {}
-  const normalized = String(reason || "Image download failed");
+  const normalized = security.uiError(reason || "图片下载失败");
   const unavailable =
     status === 401 ||
     status === 403 ||
@@ -353,7 +367,7 @@ function remoteImageFetchError(url, reason, status = null, details = {}) {
 async function ensureRemoteImagePermission(url, sender = {}) {
   let origin = "";
   try {
-    origin = new URL(url).origin;
+    origin = security.publicUrl(url).origin;
   } catch {
     return { ok: false, error: "Invalid image URL" };
   }
@@ -374,6 +388,7 @@ async function remoteImagePermissionStatus(message = {}) {
   const inputs = Array.isArray(message.origins) && message.origins.length
     ? message.origins
     : [message.origin || message.url].filter(Boolean);
+  if (inputs.length > 30) return { ok: false, error: "站点数量超限" };
   const origins = Array.from(new Set(inputs.map(remoteImageOrigin).filter(Boolean)));
   const all = await chrome.permissions.getAll?.().catch(() => null);
   const statuses = await Promise.all(
@@ -408,38 +423,13 @@ function permissionOriginPattern(origin) {
   return `${String(origin || "").replace(/\/+$/, "")}/*`;
 }
 
-function permissionPatternMatchesOrigin(pattern, origin) {
-  if (!pattern || !origin) return false;
-  if (pattern === "<all_urls>") return true;
-  const normalizedPattern = String(pattern).replace(/\/+$/, "");
-  const normalizedOrigin = String(origin).replace(/\/+$/, "");
-  if (normalizedPattern === normalizedOrigin || normalizedPattern === `${normalizedOrigin}/*`) return true;
-  try {
-    const patternUrl = new URL(normalizedPattern.replace(/\*.*$/, ""));
-    return patternUrl.origin === normalizedOrigin;
-  } catch {
-    return false;
-  }
-}
+function permissionPatternMatchesOrigin(pattern, origin) { return security.matches(pattern, origin); }
 
 async function remoteOriginAllowed(origin) {
   const pattern = permissionOriginPattern(origin);
   if (await chrome.permissions.contains({ origins: [pattern] }).catch(() => false)) return true;
   const all = await chrome.permissions.getAll?.().catch(() => null);
   return (all?.origins || []).some((grantedPattern) => permissionPatternMatchesOrigin(grantedPattern, origin));
-}
-
-function parseDataUri(uri) {
-  const match = String(uri || "").match(/^data:([^;,]+)?(;base64)?,([\s\S]*)$/);
-  if (!match) return { ok: false, error: "Invalid data URI" };
-  const mime = (match[1] || "image/png").toLowerCase();
-  if (match[2]) return { ok: true, mime, base64: match[3].replace(/\s+/g, ""), bytes: Math.floor(match[3].length * 0.75) };
-  try {
-    const base64 = btoa(unescape(encodeURIComponent(decodeURIComponent(match[3]))));
-    return { ok: true, mime, base64, bytes: Math.floor(base64.length * 0.75) };
-  } catch {
-    return { ok: false, error: "Could not decode data URI" };
-  }
 }
 
 function arrayBufferToBase64(buffer) {
@@ -477,3 +467,38 @@ function guessFileName(url) {
     return `image-${Date.now()}.png`;
   }
 }
+
+async function validatedData(uri) { try { const p = security.data(uri); await security.validate(p.bytes, p.mime); return { ok: true, mime: p.mime, base64: arrayBufferToBase64(p.bytes.buffer), bytes: p.bytes.length, fileName: "image" }; } catch { return { ok: false, error: "图片 data URI 验证失败" }; } }
+
+// 草稿只有后台这个写入者。队列与代次同时覆盖保存、禁用、过期和清空。
+let draftQueue = Promise.resolve();
+function draftOperation(message = {}) {
+  const operation = async () => {
+    const key = "xposter_sidepanel_draft", prefsKey = "xposter_draft_preferences", epochKey = "xposter_draft_epoch";
+    const stored = await chrome.storage.local.get([key, prefsKey, epochKey]);
+    let epoch = Number(stored[epochKey] || 0);
+    let prefs = stored[prefsKey] || { enabled: true, days: 7 };
+    let record = stored[key];
+    if (typeof record === "string") { record = { text: record, expires: Date.now() + prefs.days * 86400000 }; await chrome.storage.local.set({ [key]: record }); }
+    const action = message.action || "expire";
+    if (action === "configure") {
+      prefs = { enabled: message.enabled === true, days: [1, 7, 30].includes(message.days) ? message.days : 7 }; epoch++;
+      await chrome.storage.local.set({ [prefsKey]: prefs, [epochKey]: epoch });
+      if (!prefs.enabled) { await chrome.storage.local.remove(key); record = null; }
+    } else if (action === "clear") {
+      epoch++; await chrome.storage.local.set({ [epochKey]: epoch }); await chrome.storage.local.remove([key, "xposter_live_result_checks"]); record = null;
+    } else if (action === "write") {
+      if (message.epoch !== epoch || !prefs.enabled) return { ok: false, stale: true, epoch, prefs };
+      if (typeof message.text !== "string" || message.text.length > 1024 * 1024) return { ok: false, error: "草稿超出限制" };
+      record = { text: message.text, expires: Date.now() + prefs.days * 86400000 };
+      await chrome.storage.local.set({ [key]: record });
+    }
+    if (record && record.expires <= Date.now()) { await chrome.storage.local.remove(key); record = null; }
+    return { ok: true, epoch, prefs, record };
+  };
+  const result = draftQueue.then(operation); draftQueue = result.catch(() => {}); return result;
+}
+function expireDraft() { return draftOperation({ action: "expire" }); }
+chrome.alarms.create("xposter-expire-draft", { periodInMinutes: 60 });
+chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === "xposter-expire-draft") expireDraft().catch(() => {}); });
+expireDraft().catch(() => {});

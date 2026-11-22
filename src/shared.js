@@ -1,4 +1,6 @@
 (() => {
+  const security = globalThis.xPosterSecurity || (typeof require === "function" ? require("./security.js") : null);
+  function trustedVault() { if (globalThis.location?.protocol !== "chrome-extension:") throw new Error("本地图片仅可在扩展侧边栏读取，请重新选择目录"); }
   const STYLE_TAGS = {
     Bold: "strong",
     Italic: "em",
@@ -375,7 +377,7 @@
         if (link) {
           const offset = result.text.length;
           result.text += link[1];
-          result.links.push({ offset, length: link[1].length, url: link[2] });
+          if (security.safeLink(link[2])) result.links.push({ offset, length: link[1].length, url: link[2] });
           cursor += link[0].length;
           continue;
         }
@@ -513,7 +515,7 @@
         type: type || "unstyled",
         text: String(text ?? "").replace(/\n+/g, " "),
         inlineStyleRanges: (segment?.inlineStyleRanges || []).map((range) => ({ ...range })),
-        links: (segment?.links || []).map((link) => ({ ...link }))
+        links: (segment?.links || []).filter(link => security.safeLink(link.url)).map((link) => ({ ...link }))
       });
     };
     const flushList = () => {
@@ -654,6 +656,7 @@
     }
 
     for (const link of segment.links || []) {
+      if (!security.safeLink(link.url)) continue;
       const href = escapeHtml(link.url);
       openAt[link.offset]?.push(`<a href="${href}">`);
       closeAt[link.offset + link.length]?.unshift("</a>");
@@ -719,15 +722,7 @@
   }
 
   function parseDataUri(uri) {
-    const match = String(uri || "").match(/^data:([^;,]+)?(;base64)?,([\s\S]*)$/);
-    if (!match) return { ok: false, error: "Invalid data URI" };
-    const mime = (match[1] || "image/png").toLowerCase();
-    if (match[2]) return { ok: true, mime, base64: match[3].replace(/\s+/g, "") };
-    try {
-      return { ok: true, mime, base64: btoa(unescape(encodeURIComponent(decodeURIComponent(match[3])))) };
-    } catch {
-      return { ok: false, error: "Could not decode data URI" };
-    }
+    try { const parsed = security.data(uri); return { ok: true, mime: parsed.mime, base64: arrayBufferToBase64(parsed.bytes.buffer), bytes: parsed.bytes.length }; } catch { return { ok: false, error: "图片 data URI 不合法或超限" }; }
   }
 
   function arrayBufferToBase64(buffer) {
@@ -741,6 +736,7 @@
   }
 
   async function openLocalDb() {
+    trustedVault();
     return new Promise((resolve, reject) => {
       const request = indexedDB.open(LOCAL_DB, 1);
       request.onupgradeneeded = () => request.result.createObjectStore(LOCAL_STORE);
@@ -757,12 +753,14 @@
   }
 
   async function saveVaultHandle(handle) {
+    trustedVault();
     const db = await openLocalDb();
     const store = db.transaction(LOCAL_STORE, "readwrite").objectStore(LOCAL_STORE);
     await requestToPromise(store.put({ handle, name: handle.name, savedAt: Date.now() }, VAULT_KEY));
   }
 
   async function getVaultRecord() {
+    trustedVault();
     const db = await openLocalDb();
     const store = db.transaction(LOCAL_STORE, "readonly").objectStore(LOCAL_STORE);
     return (await requestToPromise(store.get(VAULT_KEY))) || null;
@@ -789,6 +787,7 @@
   }
 
   async function resolveLocalImage(source) {
+    trustedVault();
     if (!isLocalImageSource(source)) return { ok: false, error: "Not a local image source" };
     const record = await getVaultRecord();
     if (!record?.handle) return { ok: false, error: "No local image folder selected" };
@@ -819,6 +818,7 @@
       }
     });
 
+    if (parts.some(part => part === ".." || /[\\/\x00-\x1f]/.test(part))) return { ok: false, error: "图片路径不合法" };
     let depth = 0;
     for (const part of parts) {
       if (part === "..") depth -= 1;
@@ -834,7 +834,9 @@
         directory = await directory.getDirectoryHandle(part, { create: false });
       }
       const file = await (await directory.getFileHandle(parts[parts.length - 1], { create: false })).getFile();
+      if (file.size > security.MAX_BYTES || !/\.(png|jpe?g|gif|webp)$/i.test(file.name)) throw new Error("本地图片类型或大小不支持");
       const buffer = await file.arrayBuffer();
+      await security.validate(new Uint8Array(buffer), file.type || extensionMime(file.name));
       return {
         ok: true,
         base64: arrayBufferToBase64(buffer),
@@ -860,6 +862,7 @@
     const measurer = document.createElement("canvas").getContext("2d");
     measurer.font = font;
     const columnCount = table.headers.length;
+    if (columnCount > 20 || table.rows.length > 200) throw new Error("表格行列超出限制");
     const widths = Array.from({ length: columnCount }, (_, index) => {
       const values = [table.headers[index], ...table.rows.map((row) => row[index] || "")];
       const measured = Math.max(...values.map((value) => measurer.measureText(String(value)).width + paddingX * 2));
@@ -868,6 +871,7 @@
 
     const width = widths.reduce((sum, value) => sum + value, 0);
     const height = rowHeight * (table.rows.length + 1);
+    if (width * height * scale * scale > security.MAX_PIXELS) throw new Error("表格像素超出限制");
     const canvas = document.createElement("canvas");
     canvas.width = Math.ceil(width * scale);
     canvas.height = Math.ceil(height * scale);

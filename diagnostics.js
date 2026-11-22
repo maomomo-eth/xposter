@@ -146,7 +146,7 @@ async function runDiagnostics() {
     const result = await chrome.runtime.sendMessage({ type: "xposter:diagnose-active-tab" });
     latestResult = result;
     setSummary(result);
-    els.details.textContent = JSON.stringify(result, null, 2);
+    els.details.textContent = JSON.stringify(result, xPosterSecurity.exportValue, 2);
     els.copyJson.disabled = false;
   } catch (error) {
     els.details.textContent = error?.message || String(error);
@@ -182,7 +182,7 @@ async function openSidePanel() {
 
 async function copyJson() {
   if (!latestResult) return;
-  const text = JSON.stringify(latestResult, null, 2);
+  const text = JSON.stringify(latestResult, xPosterSecurity.exportValue, 2);
   try {
     await navigator.clipboard.writeText(text);
     els.copyJson.textContent = "Copied";

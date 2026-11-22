@@ -1,4 +1,11 @@
 (() => {
+  const security = globalThis.xPosterSecurity;
+  let extensionVault = {};
+  let previousDraft = null;
+  let draftEpoch = 0;
+  let importing = false;
+  let clearing = false;
+  let evidenceEpoch = 0;
   const shared = window.xPosterShared;
   const IMPORT_ICON_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v3H4V4Zm0 5h10v3H4V9Zm0 5h8v3H4v-3Zm13.5-.7V9h2v4.3l1.6-1.6 1.4 1.4-3.5 3.5-3.5-3.5 1.4-1.4 1.6 1.6ZM17 18h5v2h-5v-2Z"/></svg>';
   const els = {
@@ -1697,7 +1704,7 @@ console.log("示例代码块");
       const segment = images[index];
       const source = remoteImageProbeKey(segment);
       let result = null;
-      for (let attempt = 1; attempt <= 4; attempt += 1) {
+      for (let attempt = 1; attempt <= 1; attempt += 1) {
         try {
           result = await chrome.runtime.sendMessage({ type: "xposter:probe-image", url: source });
         } catch (error) {
@@ -1774,7 +1781,11 @@ console.log("示例代码块");
     }
   }
 
+  let remoteDraftKey = null;
   function syncRemotePermissionStatusFromDraft(parsed = latestParsed) {
+    const key = JSON.stringify(remoteHttpImageSegments(parsed).map(segment => segment.source));
+    if (key === remoteDraftKey) return;
+    remoteDraftKey = key;
     const origins = remoteImageOrigins(parsed);
     remotePermissionStatus = {
       origins,
@@ -1853,63 +1864,22 @@ console.log("示例代码块");
     }
   }
 
-  function permissionPatternMatchesOrigin(pattern, origin) {
-    if (!pattern || !origin) return false;
-    if (pattern === "<all_urls>") return true;
-    const normalizedPattern = String(pattern).replace(/\/+$/, "");
-    const normalizedOrigin = String(origin).replace(/\/+$/, "");
-    if (normalizedPattern === normalizedOrigin || normalizedPattern === `${normalizedOrigin}/*`) return true;
-    try {
-      const patternUrl = new URL(normalizedPattern.replace(/\*.*$/, ""));
-      return patternUrl.origin === normalizedOrigin;
-    } catch {
-      return false;
-    }
-  }
+  function permissionPatternMatchesOrigin(pattern, origin) { return security.matches(pattern, origin); }
 
   async function remoteOriginAllowed(origin) {
-    if (typeof chrome === "undefined" || !chrome.permissions) return false;
-    const pattern = permissionOriginPattern(origin);
-    const contains = await chrome.permissions.contains?.({ origins: [pattern] }).catch(() => false);
-    if (contains) return true;
-    const all = await chrome.permissions.getAll?.().catch(() => null);
-    const grantedOrigins = all?.origins || [];
-    return grantedOrigins.some((grantedPattern) => permissionPatternMatchesOrigin(grantedPattern, origin));
+    try { security.publicUrl(origin); } catch { return false; }
+    if (await chrome.permissions.contains({ origins: [permissionOriginPattern(origin)] }).catch(() => false)) return true;
+    const all = await chrome.permissions.getAll().catch(() => ({ origins: [] }));
+    return (all.origins || []).some(pattern => permissionPatternMatchesOrigin(pattern, origin));
   }
-
   async function checkRemoteImageOrigins(origins) {
-    const results = await Promise.all(
-      origins.map(async (origin) => {
-        const allowed = await remoteOriginAllowed(origin);
-        return { origin, allowed };
-      })
-    );
-    const granted = new Set(results.filter((item) => item.allowed).map((item) => item.origin));
-    let missing = results.filter((item) => !item.allowed).map((item) => item.origin);
-    if (missing.length && hasChromeApi()) {
-      try {
-        const workerStatus = await chrome.runtime.sendMessage({
-          type: "xposter:remote-image-permission-status",
-          origins
-        });
-        for (const origin of workerStatus?.granted || []) granted.add(origin);
-        missing = origins.filter((origin) => !granted.has(origin));
-      } catch {}
-    }
-    return {
-      granted: origins.filter((origin) => granted.has(origin)),
-      missing
-    };
+    const statuses = await Promise.all(origins.map(async origin => ({ origin, allowed: await remoteOriginAllowed(origin) })));
+    return { granted: statuses.filter(item => item.allowed).map(item => item.origin), missing: statuses.filter(item => !item.allowed).map(item => item.origin) };
   }
-
-  async function checkRemoteImageOriginsWithRetry(origins, delays = [0, 200, 600, 1200, 2400, 4000]) {
-    let latest = { granted: [], missing: origins };
-    for (const waitMs of delays) {
-      if (waitMs) await delay(waitMs);
-      latest = await checkRemoteImageOrigins(origins);
-      if (!latest.missing.length) break;
-    }
-    return latest;
+  async function checkRemoteImageOriginsWithRetry(origins, delays = [0, 100, 300]) {
+    let status;
+    for (const wait of delays) { if (wait) await delay(wait); status = await checkRemoteImageOrigins(origins); if (!status.missing.length) break; }
+    return status;
   }
 
   function applyRemotePermissionStatus(origins, granted = [], missing = origins) {
@@ -2017,7 +1987,7 @@ console.log("示例代码块");
     // When this function is called from the explicit "Allow image website"
     // click, request immediately. Chrome may reject permission requests that
     // happen after awaited status probes because the user gesture can be lost.
-    const originsToRequest = requestImmediately ? origins : (remotePermissionStatus.missing || origins);
+    const originsToRequest = (remotePermissionStatus.missing?.length ? remotePermissionStatus.missing : origins).slice(0, 1);
     const requestedOrigins = originsToRequest.map(permissionOriginPattern);
     let requestAccepted = false;
     let requestError = "";
@@ -2051,16 +2021,19 @@ console.log("示例代码块");
   }
 
   async function runRemoteImageCheckAction() {
+    const operationEpoch = evidenceEpoch;
     const parsed = ensureLatestParsedFromDraft();
+    if (parsed.segments.length > 1000 || parsed.segments.filter(s => s.type !== "text").length > 30) { log("文章资源数量超出限制"); return; }
     if (!remoteHttpImageSegments(parsed).length) {
       log("No remote image URLs detected.");
       return { ok: true, total: 0 };
     }
-    const result = await ensureRemoteImagePermissionsForDraft(parsed, { requestImmediately: true });
+    const result = await ensureRemoteImagePermissionsForDraft(parsed);
     if (!result.ok) {
       await refreshRemoteImagePermissionStatus(parsed);
       log(result.error);
-      captureEvidence("remote-image-permission-blocked", {
+      if (operationEpoch !== evidenceEpoch) return { ok: false, stale: true };
+    captureEvidence("remote-image-permission-blocked", {
         reason: result.error,
         origins: result.origins,
         missing: result.missing || [],
@@ -2072,7 +2045,8 @@ console.log("示例代码块");
     const probe = await probeRemoteImagesForDraft(parsed);
     if (probe.ok) {
       log(`Remote image check passed for ${probe.total} image(s).`);
-      captureEvidence("remote-image-check", {
+      if (operationEpoch !== evidenceEpoch) return { ok: false, stale: true };
+    captureEvidence("remote-image-check", {
         result: probe,
         permission: remotePermissionStatus,
         probe: remoteImageProbeStatus
@@ -2080,6 +2054,7 @@ console.log("示例代码块");
       return probe;
     }
     log(`Remote image check failed before import: ${probe.error}.`);
+    if (operationEpoch !== evidenceEpoch) return { ok: false, stale: true };
     captureEvidence("remote-image-check-blocked", {
       result: probe,
       permission: remotePermissionStatus,
@@ -2089,8 +2064,10 @@ console.log("示例代码块");
   }
 
   async function runRemotePermissionAction() {
+    const operationEpoch = evidenceEpoch;
     const parsed = ensureLatestParsedFromDraft();
     const result = await ensureRemoteImagePermissionsForDraft(parsed, { requestImmediately: true });
+    if (operationEpoch !== evidenceEpoch) return { ok: false, stale: true };
     let probe = null;
     if (result.ok && remoteHttpImageSegments(parsed).length) {
       probe = await probeRemoteImagesForDraft(parsed);
@@ -2099,7 +2076,8 @@ console.log("示例代码块");
       log(result.alreadyGranted ? "Image website already allowed." : "Image website allowed.");
       if (probe?.ok) log(`Remote image check passed for ${probe.total} image(s).`);
       if (probe && !probe.ok) log(`Remote image check failed before import: ${probe.error}.`);
-      captureEvidence(probe && !probe.ok ? "remote-image-check-blocked" : "remote-image-permission", {
+      if (operationEpoch !== evidenceEpoch) return { ok: false, stale: true };
+    captureEvidence(probe && !probe.ok ? "remote-image-check-blocked" : "remote-image-permission", {
         origins: result.origins || [],
         granted: result.granted || [],
         status: remotePermissionStatus,
@@ -2110,6 +2088,7 @@ console.log("示例代码块");
     }
     await refreshRemoteImagePermissionStatus(parsed);
     log(result.error);
+    if (operationEpoch !== evidenceEpoch) return { ok: false, stale: true };
     captureEvidence("remote-image-permission-blocked", {
       reason: result.error,
       origins: result.origins,
@@ -2120,7 +2099,7 @@ console.log("示例代码块");
   }
 
   function currentVault() {
-    return latestPageStatus?.vault || latestDiagnostics?.vault || null;
+    return extensionVault;
   }
 
   function countLabel(count, singular, plural = `${singular}s`) {
@@ -2379,7 +2358,7 @@ console.log("示例代码块");
   function buildImportLedger(parsed = latestParsed, counts = latestCounts) {
     const main = latestDiagnostics?.main || {};
     const status = latestPageStatus || {};
-    const vault = status.vault || latestDiagnostics?.vault || {};
+    const vault = extensionVault;
     const bridgeReady = Boolean(main.hasDraftStateNode);
     const uploadReady = Boolean(main.hasOnFilesAdded);
     const localVaultReady = Boolean(vault.configured && vault.permission === "granted");
@@ -2588,7 +2567,7 @@ console.log("示例代码块");
     const coverInBody = Boolean(parsed?.cover && imageSegments.some((segment) => segment.source === parsed.cover));
     const status = latestPageStatus || {};
     const main = latestDiagnostics?.main || {};
-    const vault = status.vault || latestDiagnostics?.vault || {};
+    const vault = extensionVault;
     const needsUploads = (counts.image || 0) + (counts.table || 0) > 0;
     const uploadReady = !needsUploads || Boolean(main.hasOnFilesAdded);
     const bridgeReady = Boolean(main.hasDraftStateNode);
@@ -3729,7 +3708,7 @@ console.log("示例代码块");
     const counts = latestCounts || shared.segmentCounts([]);
     const status = latestPageStatus || {};
     const main = latestDiagnostics?.main || {};
-    const vault = status.vault || latestDiagnostics?.vault || {};
+    const vault = extensionVault;
     const specialBlocks = (counts.code || 0) + (counts.divider || 0) + (counts.tweet || 0);
     const images = counts.image || 0;
     const tables = counts.table || 0;
@@ -4047,7 +4026,7 @@ console.log("示例代码块");
   function log(message) {
     const item = document.createElement("li");
     const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    item.textContent = `${time} ${message}`;
+    item.textContent = `${time} ${security.uiError(message)}`;
     if (els.activityPanel) els.activityPanel.hidden = false;
     els.activityLog.prepend(item);
     while (els.activityLog.children.length > 8) els.activityLog.lastElementChild.remove();
@@ -4697,7 +4676,7 @@ console.log("示例代码块");
     else if (response.hasEditor) setPageState("Editor ready", "ready");
     else if (response.isArticleRoute) setPageState("Articles", "ready");
     else setPageState("Not article", "warn");
-    updateVaultState(response.vault);
+    await restoreVaultState();
     setReadiness({
       target: response.isArticleRoute ? "Articles" : "Go Articles",
       editor: response.hasEditor ? "Ready" : response.isArticleRoute ? "Can create" : "Not ready",
@@ -4739,12 +4718,19 @@ console.log("示例代码块");
   }
 
   async function importDraft(event) {
-    const markdown = els.markdown.value.trim();
+    if (importing || clearing) return;
+    importing = true;
+    try {
+    const initialTab = await activeTab();
+    const draftVersion = els.markdown.value;
+    const markdown = draftVersion.trim();
     if (!markdown) {
       log("Paste or load Markdown first.");
       return;
     }
+    if (markdown.length > 1024 * 1024) { log("Markdown 超出 1 MiB 限制"); return; }
     const parsed = ensureLatestParsedFromDraft();
+    if (parsed.segments.length > 1000 || parsed.segments.filter(s => s.type !== "text").length > 30) { log("文章资源数量超出限制"); return; }
     updatePreflight();
     let currentChecks = buildPreflightChecks();
     let currentGate = getImportGate(currentChecks);
@@ -4840,7 +4826,17 @@ console.log("示例代码块");
     els.importDraft.textContent = "Importing...";
     resetLiveProgress("import");
     log("Import started.");
-    const response = await sendToActiveTab({ type: "xposter:import-markdown", markdown });
+    let response;
+    try {
+      const localFiles = {}; let total = 0;
+      for (const segment of parsed.segments.filter(s => s.type === "image" && shared.isLocalImageSource(s.source))) {
+        const file = await shared.resolveLocalImage(segment.source); if (!file.ok) throw new Error(file.error);
+        total += file.bytes; if (total > security.MAX_TOTAL) throw new Error("本地图片总量超限"); localFiles[segment.source] = file;
+      }
+      const finalTab = await activeTab();
+      if (!initialTab?.id || finalTab?.id !== initialTab.id || finalTab.url !== initialTab.url || els.markdown.value !== draftVersion) throw new Error("目标标签页或草稿版本已变化，已取消");
+      response = await chrome.tabs.sendMessage(initialTab.id, { type: "xposter:import-markdown", markdown, localFiles, targetUrl: initialTab.url });
+    } catch (error) { response = { ok: false, error: security.uiError(error.message) }; }
     if (response?.ok) {
       const seconds = ((response.summary?.elapsedMs || 0) / 1000).toFixed(1);
       log(`Import complete in ${seconds}s.`);
@@ -4854,6 +4850,7 @@ console.log("示例代码块");
     }
     updatePreflight();
     refreshPageState();
+    } finally { importing = false; }
   }
 
   function renderRunSummary(summary) {
@@ -4985,15 +4982,22 @@ console.log("示例代码块");
       const file = input.files?.[0];
       input.remove();
       if (!file) return;
-      els.markdown.value = await file.text();
+      if (file.size > 1024 * 1024) { log("Markdown 文件超出限制"); return; }
+      const before = els.markdown.value; const text = await file.text();
+      if (els.markdown.value !== before) { log("草稿版本已变化，已取消载入"); return; }
+      if (before.trim() && !confirm("文件将替换当前草稿，可通过恢复替换前草稿按钮撤回。继续？")) return;
+      previousDraft = before;
+      els.markdown.value = text;
       saveDraft();
       analyzeDraft();
-      log(`Loaded ${file.name}.`);
+      log("Markdown 文件已载入。");
     });
     input.click();
   }
 
   async function loadSmokeFixture() {
+    if (els.markdown.value.trim() && !confirm("示例将替换当前草稿，可恢复。继续？")) return;
+    previousDraft = els.markdown.value;
     els.markdown.value = currentLanguage === "zh" ? EXAMPLE_DRAFT_ZH : EXAMPLE_DRAFT;
     log("Loaded example Markdown draft.");
     saveDraft();
@@ -5001,46 +5005,77 @@ console.log("示例代码块");
   }
 
   async function chooseVault() {
-    const response = await sendToActiveTab({ type: "xposter:choose-vault" });
-    if (response?.ok) {
-      log(`Local image folder set: ${response.name}.`);
-      await refreshPageState();
-      return;
-    }
-    if (response?.skipped) log("Local image folder selection skipped.");
-    else log(`Local image folder setup failed: ${response?.error || "open an X page first"}`);
+    try { const handle = await window.showDirectoryPicker({ id: "xposter_extension_images", mode: "read" });
+      if (await shared.ensureReadPermission(handle) !== "granted") throw new Error("目录未授权");
+      await shared.saveVaultHandle(handle); await restoreVaultState();
+    } catch (error) { log(security.uiError(error.message)); }
   }
-
   async function clearVault() {
-    const response = await sendToActiveTab({ type: "xposter:clear-vault" });
-    if (response?.ok) {
-      log("Local image folder cleared.");
-      await refreshPageState();
-      return;
-    }
-    log(`Could not clear local image folder: ${response?.error || "open an X page first"}`);
+    await shared.clearVaultHandle(); await restoreVaultState();
+    log("目录记录已删除；不等于撤销授权。旧 X 站点授权请到浏览器站点设置手动撤销。");
   }
-
+  let draftTimer = null;
+  const DRAFT_PREFS = "xposter_draft_preferences";
+  let draftPrefs = { enabled: true, days: 7 };
+  function applyDraftSettings(epoch, prefs, notify = false) {
+    if (!Number.isInteger(epoch) || epoch < draftEpoch || !prefs) return;
+    const changed = epoch !== draftEpoch || prefs.enabled !== draftPrefs.enabled || prefs.days !== draftPrefs.days;
+    if (changed) clearTimeout(draftTimer);
+    draftEpoch = epoch;
+    draftPrefs = prefs;
+    const toggle = document.getElementById("autoSaveDraft");
+    const days = document.getElementById("draftDays");
+    if (toggle) toggle.checked = prefs.enabled;
+    if (days) days.value = String(prefs.days);
+    if (changed && notify) log(prefs.enabled
+      ? "草稿设置或清空状态已同步，旧的待保存内容已丢弃；请新增输入后保存，或手动备份当前正文。"
+      : "自动保存已在其他操作中关闭，待保存内容已丢弃；当前正文仅留在本页，请手动备份。");
+  }
+  if (hasChromeApi()) chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local" || !changes.xposter_draft_epoch && !changes[DRAFT_PREFS]) return;
+    applyDraftSettings(changes.xposter_draft_epoch?.newValue ?? draftEpoch, changes[DRAFT_PREFS]?.newValue || draftPrefs, true);
+  });
   function saveDraft() {
-    if (!hasChromeApi()) return;
-    chrome.storage.local.set({ [STORAGE_DRAFT]: els.markdown.value });
+    clearTimeout(draftTimer);
+    if (!hasChromeApi() || !draftPrefs.enabled) return;
+    // 绑定触发本次保存的输入和代次；同步新设置不重放旧正文。
+    const epoch = draftEpoch;
+    const text = els.markdown.value;
+    draftTimer = setTimeout(async () => {
+      if (epoch !== draftEpoch || !draftPrefs.enabled) return;
+      try {
+        const result = await chrome.runtime.sendMessage({ type: "xposter:draft", action: "write", epoch, text });
+        if (result.stale) {
+          applyDraftSettings(result.epoch, result.prefs, true);
+          log("本次草稿保存因设置或清空代次变化被取消，未自动重试；请新增输入或手动备份。");
+        } else if (!result.ok) throw new Error();
+      }
+      catch { log("草稿保存失败，请手动备份原文"); }
+    }, 600);
   }
-
   async function restoreDraft() {
-    if (!hasChromeApi()) {
-      analyzeDraft();
-      return;
-    }
-    const stored = await chrome.storage.local.get(STORAGE_DRAFT);
-    els.markdown.value = stored[STORAGE_DRAFT] || "";
+    if (!hasChromeApi()) { analyzeDraft(); return; }
+    const stored = await chrome.runtime.sendMessage({ type: "xposter:draft", action: "read" });
+    if (!stored?.ok) { log("草稿恢复失败，请重试"); return; }
+    applyDraftSettings(stored.epoch, stored.prefs);
+    if (stored.epoch === draftEpoch && draftPrefs.enabled && stored.record) els.markdown.value = stored.record.text || "";
+    const controls = document.createElement("div");
+    controls.innerHTML = '<label><input type="checkbox" id="autoSaveDraft"> 自动保存草稿</label> <label>保存期限 <select id="draftDays"><option value="1">1 天</option><option value="7">7 天</option><option value="30">30 天</option></select></label> <button type="button" id="restoreBeforeImport">恢复导入前正文</button> <button type="button" id="restoreInputDraft">恢复替换前草稿</button>';
+    els.markdown.parentElement.appendChild(controls);
+    const toggle = controls.querySelector("input"); const days = controls.querySelector("select");
+    toggle.checked = draftPrefs.enabled; days.value = String(draftPrefs.days);
+    controls.querySelector("#restoreInputDraft").onclick = () => { if (previousDraft !== null && confirm("恢复替换前草稿？")) { const current = els.markdown.value; els.markdown.value = previousDraft; previousDraft = current; saveDraft(); analyzeDraft(); } };
+    controls.querySelector("button").onclick = async () => { const result = await sendToActiveTab({ type: "xposter:restore" }); log(result?.ok ? "已恢复导入前的正文。" : result?.error || "恢复失败"); };
+    controls.onchange = async () => { clearTimeout(draftTimer); try { const result = await chrome.runtime.sendMessage({ type: "xposter:draft", action: "configure", enabled: toggle.checked, days: Number(days.value) }); if (!result.ok) throw new Error(); applyDraftSettings(result.epoch, result.prefs, true); } catch { log("草稿设置保存失败"); } };
     analyzeDraft();
   }
-
   async function restoreVaultState() {
-    els.vaultState.textContent = "Choose from an active X page";
-    els.vaultDetail.textContent = "Choose from an active X page when Markdown uses relative image paths.";
-    els.vaultSettingsText.textContent = "Choose from an active X tab so browser permissions are attached to the page.";
-    setVaultClearEnabled(false);
+    const record = await shared.getVaultRecord().catch(() => null);
+    extensionVault = record?.handle ? { configured: true, name: "扩展内所选目录", permission: await shared.queryReadPermission(record.handle), savedAt: record.savedAt } : { configured: false };
+    if (latestPageStatus) latestPageStatus.vault = extensionVault;
+    updateVaultState(extensionVault);
+    updatePreflight();
+    els.vaultSettingsText.textContent += " 目录仅在扩展源保存。旧 X 目录记录会清除；删除不等于撤权，请到浏览器站点设置撤销旧授权。";
   }
 
   function updateVaultState(vault) {
@@ -5072,16 +5107,20 @@ console.log("示例代码块");
   }
 
   async function runPreflight() {
+    const operationEpoch = evidenceEpoch;
+    try {
     els.runPreflight.disabled = true;
     els.runPreflight.textContent = "Checking...";
     log("Publishing check started.");
     await refreshPageState();
     const response = await sendToActiveTab({ type: "xposter:diagnostics" });
+    if (operationEpoch !== evidenceEpoch) return { ok: false, stale: true };
     latestDiagnostics = response?.ok ? response : { ok: false, error: response?.error || "Diagnostics unavailable" };
     await refreshRemoteImagePermissionStatus(latestParsed);
     const locked = response?.ok ? lockTargetContext("preflight") : null;
     if (locked) log(`Article confirmed: ${locked.context.articleId ? `article ${locked.context.articleId}` : "the open X Article"}.`);
     updatePreflight();
+    if (operationEpoch !== evidenceEpoch) return { ok: false, stale: true };
     captureEvidence("preflight", {
       checks: buildPreflightChecks(),
       targetLock,
@@ -5093,6 +5132,7 @@ console.log("示例代码块");
     else log("Publishing check passed without blockers.");
     els.runPreflight.disabled = false;
     els.runPreflight.textContent = "Check";
+    } finally { els.runPreflight.disabled = false; els.runPreflight.textContent = "Check"; }
   }
 
   function captureEvidence(kind, payload) {
@@ -5387,7 +5427,7 @@ console.log("示例代码块");
   function jsonSafeReplacer(key, value) {
     if (key === "handle") return "[FileSystemHandle]";
     if (typeof value === "function") return "[Function]";
-    return value;
+    return security.exportValue(key, value);
   }
 
   async function copyEvidence() {
@@ -5568,11 +5608,26 @@ console.log("示例代码块");
   els.runPreflight.addEventListener("click", runPreflight);
   els.loadFile.addEventListener("click", loadFile);
   els.loadSmoke.addEventListener("click", loadSmokeFixture);
-  els.clearDraft.addEventListener("click", () => {
-    els.markdown.value = "";
-    saveDraft();
-    analyzeDraft();
-    log("Draft cleared.");
+  els.clearDraft.addEventListener("click", async () => {
+    if (importing || clearing || remoteImageProbeStatus.state === "checking") { log("导入、检查或清理正在进行，请完成后再清空"); return; }
+    clearing = true; evidenceEpoch++;
+    try {
+    const tabs = await chrome.tabs.query({ url: ["https://x.com/*", "https://twitter.com/*"] });
+    const replies = await Promise.all(tabs.map(tab => chrome.tabs.sendMessage(tab.id, { type: "xposter:clear-records" }).catch(() => ({ ok: false }))));
+    if (replies.some(reply => !reply?.ok)) { log("文章正在导入或无法确认清理，请稍后重试"); return; }
+    const cache = await chrome.runtime.sendMessage({ type: "xposter:clear-cache" });
+    if (!cache?.ok) { log(cache?.error || "暂时无法清理下载缓存"); return; }
+    clearTimeout(draftTimer);
+    const cleared = await chrome.runtime.sendMessage({ type: "xposter:draft", action: "clear" });
+    if (!cleared?.ok) { log("草稿清理失败"); return; }
+    draftEpoch = cleared.epoch;
+    els.markdown.value = ""; analyzeDraft(); clearTimeout(draftTimer);
+    targetLock = null; resetRemoteImageProbeStatus();
+    previousDraft = null;
+    latestEvidence = null; latestDiagnostics = null; latestProgress = createLiveProgressState();
+    els.evidenceText.textContent = ""; els.activityLog.replaceChildren();
+    log("草稿及本次诊断记录已清除。");
+    } finally { clearing = false; }
   });
   els.pickVault.addEventListener("click", chooseVault);
   els.pickVaultSettings.addEventListener("click", chooseVault);

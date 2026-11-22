@@ -1,5 +1,14 @@
 (() => {
   const shared = window.xPosterShared;
+  const security = globalThis.xPosterSecurity;
+  let localFiles = {};
+  let expectedTarget = null;
+  function contentVersion() { return findEditor()?.textContent || ""; }
+  function assertTarget(target, version) { if (location.href !== target || version !== undefined && contentVersion() !== version) throw new Error("目标文章或正文已变化，已取消导入"); }
+  // 只删除旧应用记录，不宣称撤销站点已取得的目录权限。
+  const cleanup = indexedDB.open("xposter_local_assets", 1);
+  cleanup.onupgradeneeded = () => cleanup.result.createObjectStore("handles");
+  cleanup.onsuccess = () => { const db = cleanup.result; const tx = db.transaction("handles", "readwrite"); tx.objectStore("handles").delete("vault_root"); tx.oncomplete = () => db.close(); };
   const CHANNEL_TO_MAIN = "xposter";
   const CHANNEL_FROM_MAIN = "xposter-main";
   const STATUS_ID = "__xposter_status__";
@@ -20,7 +29,7 @@
       : "dev";
 
   const DEFAULT_LIMITS = {
-    maxImagesPerImport: Number.POSITIVE_INFINITY,
+    maxImagesPerImport: 30,
     maxTablesPerImport: Number.POSITIVE_INFINITY,
     maxTweetsPerImport: Number.POSITIVE_INFINITY,
     appendSignature: false
@@ -56,7 +65,7 @@
       articleId: articleIdFromUrl(),
       hasEditor: Boolean(editor),
       editorTextLength: editorText.length,
-      editorSample: editorText ? truncateText(editorText, 180) : "",
+      editorSample: "",
       originalImporterResidue: detectOriginalImporterResidue()
     };
   }
@@ -89,6 +98,7 @@
   }
 
   function showStatus(text, level = "work", timeout = 0) {
+    text = security.uiError(text);
     let bar = document.getElementById(STATUS_ID);
     if (!bar) {
       bar = document.createElement("div");
@@ -152,7 +162,7 @@
     return new Promise((resolve) => {
       const deadline = Date.now() + timeoutMs;
       const listener = (event) => {
-        if (event.source !== window || event.data?.source !== CHANNEL_FROM_MAIN) return;
+        if (event.source !== window || event.origin !== location.origin || event.data?.source !== CHANNEL_FROM_MAIN) return;
         if (event.data.kind === "ready") {
           state.mainReady = true;
           window.removeEventListener("message", listener);
@@ -161,7 +171,7 @@
       };
       window.addEventListener("message", listener);
       const tick = () => {
-        window.postMessage({ source: CHANNEL_TO_MAIN, kind: "ready?" }, "*");
+        window.postMessage({ source: CHANNEL_TO_MAIN, kind: "ready?" }, location.origin);
         if (state.mainReady) return;
         if (Date.now() > deadline) {
           window.removeEventListener("message", listener);
@@ -174,7 +184,23 @@
     });
   }
 
+  function captureMainContext() {
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { window.removeEventListener("message", listener); reject(new Error("无法锁定正文版本")); }, 3000);
+      const listener = event => {
+        if (event.source !== window || event.origin !== location.origin || event.data?.source !== CHANNEL_FROM_MAIN || event.data.kind !== "context" || event.data.requestId !== requestId) return;
+        clearTimeout(timer); window.removeEventListener("message", listener);
+        if (!event.data.token) reject(new Error("无法锁定 Draft.js 版本")); else resolve(event.data.token);
+      };
+      window.addEventListener("message", listener);
+      window.postMessage({ source: CHANNEL_TO_MAIN, kind: "capture-context", requestId }, location.origin);
+    });
+  }
+
   function runMain(payload, filePayloads = new Map()) {
+    const sessionId = crypto.randomUUID();
+    const expiresAt = Date.now() + 5 * 60 * 1000;
     return new Promise((resolve, reject) => {
       let timeout = null;
       const refreshTimeout = () => {
@@ -185,27 +211,30 @@
         }, 60000);
       };
       const listener = (event) => {
-        if (event.source !== window || event.data?.source !== CHANNEL_FROM_MAIN) return;
+        if (event.source !== window || event.origin !== location.origin || event.data?.source !== CHANNEL_FROM_MAIN) return;
         const message = event.data;
+        if (message.sessionId !== sessionId || Date.now() > expiresAt || location.href !== payload.targetUrl) return;
         if (message.kind === "file-request") {
           const key = message.token || message.marker;
+          if (typeof message.requestId !== "string" || message.requestId.length > 100) return;
           const file = filePayloads.get(key);
+          filePayloads.delete(key);
           window.postMessage(
             {
               source: CHANNEL_TO_MAIN,
               kind: "file-response",
+              sessionId,
               requestId: message.requestId,
               ok: Boolean(file),
               file: file || null,
               error: file ? null : "Prepared image data was not found"
             },
-            "*"
+            location.origin
           );
-          refreshTimeout();
           return;
         }
         if (message.kind === "progress") {
-          showStatus(message.text || "...", message.level || "work");
+          showStatus("X 正在处理本次导入…", "work");
           refreshTimeout();
           return;
         }
@@ -223,7 +252,7 @@
       };
       window.addEventListener("message", listener);
       refreshTimeout();
-      window.postMessage({ source: CHANNEL_TO_MAIN, kind: "run", payload }, "*");
+      window.postMessage({ source: CHANNEL_TO_MAIN, kind: "run", sessionId, payload }, location.origin);
     });
   }
 
@@ -234,10 +263,18 @@
     showStatus("Preparing Markdown...", "work");
     try {
       if (!isArticleRoute()) throw new Error("Open X Articles first");
+      if (expectedTarget && expectedTarget !== location.href) throw new Error("目标标签页已变化");
       if (origin !== "paste" && !findEditor()) {
         await ensureEditorReadyForFileImport();
       }
+      if (typeof markdown !== "string" || markdown.length > 1024 * 1024) throw new Error("Markdown 超出 1 MiB 限制");
+      const targetUrl = location.href;
+      const version = contentVersion();
+      const contextToken = await captureMainContext();
+      if (!window.confirm("导入将整体替换当前文章正文。替换前会保留正文快照，可在侧边栏恢复（刷新或关闭 X 页面后失效）。是否继续？")) throw new Error("已取消替换");
+      assertTarget(targetUrl, version);
       const parsed = shared.parseMarkdown(markdown);
+      if (parsed.segments.length > 1000 || parsed.segments.filter(s => s.type !== "text").length > 30) throw new Error("文章资源数量超出限制");
       const { segments, dropped } = shared.applyLimits(parsed.segments, DEFAULT_LIMITS);
       const limitedParsed = { ...parsed, segments };
       const counts = shared.segmentCounts(segments);
@@ -261,19 +298,29 @@
       }
 
       const imageMap = await prepareImages(segments);
-      const tableMap = await prepareTables(segments);
+      const tableMap = await prepareTables(segments, [...imageMap.values()].reduce((sum, file) => sum + (file.bytes || 0), 0));
       const mediaFailures = collectMediaFailures(imageMap, "image").concat(collectMediaFailures(tableMap, "table"));
       if (mediaFailures.length) {
         const error = new Error(formatMediaFailureMessage(mediaFailures));
         error.mediaFailures = mediaFailures;
         throw error;
       }
+      let totalBytes = 0;
+      for (const file of [...imageMap.values(), ...tableMap.values()]) { totalBytes += file.bytes || Math.ceil((file.base64 || "").length * 0.75); }
+      if (totalBytes > security.MAX_TOTAL) throw new Error("文章图片总量超过 64 MiB");
+      assertTarget(targetUrl, version);
       const pastePlan = shared.buildPastePlan(segments, imageMap, tableMap);
       const filePayloads = streamImageFilesForMain(pastePlan);
       pastePlan.title = limitedParsed.title || null;
       pastePlan.cover = limitedParsed.cover || null;
+      for (const item of pastePlan.plan) { if (item.op.source) { if (item.op.source === pastePlan.cover) pastePlan.cover = item.marker; item.op.source = item.marker; } }
+      if (!pastePlan.plan.some(item => item.marker === pastePlan.cover)) pastePlan.cover = null;
       pastePlan.origin = origin;
+      pastePlan.targetUrl = targetUrl;
+      pastePlan.expectedText = version;
+      pastePlan.contextToken = contextToken;
 
+      if (!security.planSchema(pastePlan)) throw new Error("导入计划格式或尺寸不符合限制");
       showStatus("Writing into X editor...", "work");
       const mainSummary = await runMain(pastePlan, filePayloads);
       if (mainSummary?.imgFail) {
@@ -307,87 +354,8 @@
     }
   }
 
-  async function ensureVaultForLocalImages(count) {
-    const existing = await shared.getVaultRecord().catch(() => null);
-    if (existing?.handle && (await shared.queryReadPermission(existing.handle)) === "granted") return;
-    if (typeof window.showDirectoryPicker !== "function") {
-      showStatus(`${count} local image(s) skipped: directory picker is unavailable`, "warn", 3000);
-      return;
-    }
-    showStatus(`${count} local image(s) need a local image folder...`, "warn");
-    const result = await promptVaultSelection(count);
-    if (!result.ok && !result.skipped) {
-      throw new Error(result.error || "Local image folder was not selected");
-    }
-  }
-
-  function promptVaultSelection(count = 0) {
-    return new Promise((resolve) => {
-      document.getElementById("__xposter_vault_prompt__")?.remove();
-      const overlay = document.createElement("div");
-      overlay.id = "__xposter_vault_prompt__";
-      overlay.style.cssText = [
-        "position:fixed",
-        "inset:0",
-        "z-index:2147483646",
-        "display:grid",
-        "place-items:center",
-        "background:rgba(32,31,27,.48)",
-        "font:14px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
-      ].join(";");
-
-      const panel = document.createElement("div");
-      panel.style.cssText = [
-        "width:min(440px,calc(100vw - 40px))",
-        "background:#fbfaf7",
-        "color:#201f1b",
-        "border:1px solid #d8d2c6",
-        "box-shadow:0 22px 60px rgba(32,31,27,.28)",
-        "padding:22px"
-      ].join(";");
-      panel.innerHTML = `
-        <div style="font-size:17px;font-weight:760;margin-bottom:6px;">Local image folder</div>
-        <div style="color:#6b665e;margin-bottom:14px;">${shared.escapeHtml(
-          count ? `${count} local image(s) need a root folder.` : "Choose the folder that contains your Markdown images."
-        )}</div>
-        <div style="background:#f4f0e8;border:1px solid #d8d2c6;padding:10px 12px;color:#6b665e;font-size:12px;margin-bottom:16px;">
-          If your Markdown says <code>![](./img/cover.png)</code>, choose the folder that contains the <code>img</code> directory.
-        </div>
-        <div style="display:flex;justify-content:flex-end;gap:8px;">
-          <button id="xposter-vault-skip" style="height:36px;padding:0 13px;border:1px solid #d8d2c6;background:#fbfaf7;color:#201f1b;font:inherit;font-weight:700;cursor:pointer;">Skip</button>
-          <button id="xposter-vault-pick" style="height:36px;padding:0 14px;border:0;background:#2f6f68;color:#fbfaf7;font:inherit;font-weight:760;cursor:pointer;">Choose folder</button>
-        </div>
-      `;
-      overlay.appendChild(panel);
-      document.body.appendChild(overlay);
-
-      const finish = (value) => {
-        overlay.remove();
-        resolve(value);
-      };
-      panel.querySelector("#xposter-vault-skip").addEventListener("click", () => finish({ ok: false, skipped: true }));
-      panel.querySelector("#xposter-vault-pick").addEventListener("click", async () => {
-        try {
-          const handle = await window.showDirectoryPicker({ id: "xposter_vault_root", mode: "read" });
-          const permission = await shared.ensureReadPermission(handle);
-          if (permission !== "granted") {
-            finish({ ok: false, error: "Read permission was not granted" });
-            return;
-          }
-          await shared.saveVaultHandle(handle);
-          showStatus(`Local image folder set: ${handle.name}`, "done", 3500);
-          finish({ ok: true, name: handle.name });
-        } catch (error) {
-          finish(
-            error?.name === "AbortError"
-              ? { ok: false, skipped: true }
-              : { ok: false, error: error?.message || String(error) }
-          );
-        }
-      });
-    });
-  }
-
+  async function ensureVaultForLocalImages() { if (!Object.keys(localFiles).length) throw new Error("请从扩展侧边栏选择目录并导入本地图片；旧 X 目录记录已清除，请在浏览器站点设置中撤销旧目录授权。删除记录不会撤销权限。"); }
+  async function promptVaultSelection() { return { ok: false, error: "请在扩展侧边栏选择目录" }; }
   async function prepareImages(segments) {
     const images = segments.filter((segment) => segment.type === "image");
     const map = new Map();
@@ -396,13 +364,17 @@
     const concurrency = 3;
     let next = 0;
     let completed = 0;
+    let bytes = 0;
     const worker = async () => {
       while (next < images.length) {
         const index = next;
         next += 1;
         const segment = images[index];
         showStatus(`Preparing image ${index + 1}/${images.length}...`, "work");
-        map.set(segment, await loadImageWithRetry(segment.source, `image-${index + 1}`));
+        const file = await loadImageWithRetry(segment.source, `image-${index + 1}`);
+        bytes += file?.bytes || 0;
+        if (bytes > security.MAX_TOTAL) throw new Error("文章图片总量超出限制");
+        map.set(segment, file);
         completed += 1;
         showStatus(`Prepared ${completed}/${images.length} image(s)...`, "work");
         await sleep(120);
@@ -421,19 +393,18 @@
     for (const item of pastePlan.plan || []) {
       if (item?.op?.type !== "image" || !item.op.file?.base64) continue;
       const token = item.marker;
-      filePayloads.set(token, item.op.file);
+      filePayloads.set(token, { base64: item.op.file.base64, mime: item.op.file.mime, fileName: `image-${filePayloads.size + 1}.${item.op.file.mime.split("/")[1]}`, bytes: item.op.file.bytes });
       item.op.file = {
         token,
         mime: item.op.file.mime,
-        fileName: item.op.file.fileName,
-        alt: item.op.file.alt || "",
+        fileName: `image-${filePayloads.size}.${item.op.file.mime.split("/")[1]}`,
         bytes: item.op.file.bytes || null
       };
     }
     return filePayloads;
   }
 
-  async function loadImageWithRetry(source, fallbackName, attempts = 4) {
+  async function loadImageWithRetry(source, fallbackName, attempts = 1) {
     let last = null;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       last = await loadImage(source, fallbackName);
@@ -491,15 +462,7 @@
   }
 
   async function loadImage(source, fallbackName) {
-    if (source.startsWith("data:")) {
-      const parsed = shared.parseDataUri(source);
-      return parsed.ok
-        ? { ok: true, ...parsed, fileName: `${fallbackName}.png`, source }
-        : { ok: false, error: parsed.error, source };
-    }
-    if (shared.isLocalImageSource(source)) {
-      return shared.resolveLocalImage(source);
-    }
+    if (shared.isLocalImageSource(source)) { const file = localFiles[source]; if (!file) return { ok: false, error: "未准备本地图片" }; await security.validate(security.data(`data:${file.mime};base64,${file.base64}`).bytes, file.mime); return file; }
     try {
       const result = await chrome.runtime.sendMessage({ type: "xposter:fetch-image", url: source });
       if (!result?.ok) {
@@ -530,20 +493,21 @@
     return /^https?:\/\//i.test(String(source || "").trim());
   }
 
-  async function prepareTables(segments) {
+  async function prepareTables(segments, totalBytes = 0) {
     const tables = segments.filter((segment) => segment.type === "table");
     const map = new Map();
     if (!tables.length) return map;
     showStatus(`Rendering ${tables.length} table(s)...`, "work");
-    await Promise.all(
-      tables.map(async (segment, index) => {
+    for (const [index, segment] of tables.entries()) {
         try {
-          map.set(segment, await shared.renderTableImage(segment, `table-${index + 1}.png`));
+          const file = await shared.renderTableImage(segment, `table-${index + 1}.png`);
+          totalBytes += file.bytes || 0;
+          if (totalBytes > security.MAX_TOTAL) throw new Error("文章图片总量超出限制");
+          map.set(segment, file);
         } catch (error) {
           map.set(segment, { ok: false, error: error?.message || String(error) });
         }
-      })
-    );
+    }
     return map;
   }
 
@@ -624,27 +588,20 @@
     return `${base || fallbackName}.${ext}`;
   }
 
-  async function onPaste(event) {
-    if (!isArticleRoute()) return;
-    const editor = event.target?.closest?.(".public-DraftEditor-content");
-    if (!editor || editor.getBoundingClientRect().width < 200) return;
-    const text = event.clipboardData?.getData("text/plain") || "";
-    if (!shared.looksLikeMarkdown(text)) return;
-    event.preventDefault();
-    event.stopPropagation();
-    await importMarkdown(text, "paste");
-  }
+  async function onPaste() { /* 普通粘贴保留 X 原生选区行为；整体导入使用显式按钮。 */ }
 
   async function readMarkdownFile(file) {
     if (!/\.(md|markdown|mdown|mkd|txt)$/i.test(file.name)) {
       throw new Error("Choose a Markdown file");
     }
+    if (file.size > 1024 * 1024) throw new Error("Markdown 超出限制");
     return file.text();
   }
 
   async function importFile(file, origin = "file") {
+    const targetUrl = location.href; const version = contentVersion();
     const text = await readMarkdownFile(file);
-    await ensureEditorReadyForFileImport();
+    assertTarget(targetUrl, version);
     return importMarkdown(text, origin);
   }
 
@@ -854,18 +811,7 @@
         await importFile(markdown, "drop");
         return;
       }
-      try {
-        const handle = await getDirectoryHandle(directoryItem);
-        if (handle?.kind === "directory") {
-          const permission = await shared.ensureReadPermission(handle);
-          if (permission === "granted") {
-            await shared.saveVaultHandle(handle);
-            showStatus(`Local image folder set: ${handle.name}`, "done", 4000);
-          }
-        }
-      } catch (error) {
-        showStatus(error?.message || "Could not set local image folder", "error", 5000);
-      }
+      showStatus("请在扩展侧边栏选择本地图片目录", "warn", 5000);
     }, true);
   }
 
@@ -937,7 +883,9 @@
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === "xposter:import-markdown") {
-      importMarkdown(message.markdown || "", "sidepanel").then(sendResponse);
+      if (state.busy) { sendResponse({ ok: false, error: "导入正在进行" }); return false; }
+      localFiles = message.localFiles || {}; expectedTarget = message.targetUrl;
+      importMarkdown(message.markdown || "", "sidepanel").then(sendResponse).finally(() => { localFiles = {}; expectedTarget = null; });
       return true;
     }
     if (message?.type === "xposter:analyze-markdown") {
@@ -978,9 +926,27 @@
       });
       return false;
     }
-    if (message?.type === "xposter:choose-vault") {
-      promptVaultSelection(0).then(sendResponse);
+    if (message?.type === "xposter:clear-records") {
+      if (state.busy) { sendResponse({ ok: false, error: "导入正在进行" }); return false; }
+      const requestId = crypto.randomUUID();
+      const timer = setTimeout(() => { window.removeEventListener("message", listener); sendResponse({ ok: false, error: "清理超时" }); }, 2500);
+      const listener = event => { if (event.source !== window || event.origin !== location.origin || event.data?.source !== CHANNEL_FROM_MAIN || event.data.kind !== "clear-result" || event.data.requestId !== requestId) return;
+        clearTimeout(timer); window.removeEventListener("message", listener); if (event.data.ok) state.lastSummary = null; sendResponse({ ok: event.data.ok === true }); };
+      window.addEventListener("message", listener); window.postMessage({ source: CHANNEL_TO_MAIN, kind: "clear-records", requestId }, location.origin); return true;
+    }
+    if (message?.type === "xposter:restore") {
+      if (!confirm("恢复导入前的正文快照？当前正文将被替换。")) { sendResponse({ ok: false, error: "已取消恢复" }); return false; }
+      const requestId = crypto.randomUUID();
+      const timer = setTimeout(() => { window.removeEventListener("message", listener); sendResponse({ ok: false, error: "恢复超时" }); }, 2500);
+      const listener = event => { if (event.source !== window || event.origin !== location.origin || event.data?.source !== CHANNEL_FROM_MAIN || event.data.kind !== "restore-result" || event.data.requestId !== requestId) return;
+        clearTimeout(timer); window.removeEventListener("message", listener); sendResponse({ ok: event.data.ok === true, error: event.data.ok ? null : "当前文章没有可用快照，或导入正在进行；刷新会清除快照" }); };
+      window.addEventListener("message", listener);
+      window.postMessage({ source: CHANNEL_TO_MAIN, kind: "restore", requestId, targetUrl: location.href }, location.origin);
       return true;
+    }
+    if (message?.type === "xposter:choose-vault") {
+      sendResponse({ ok: false, error: "请在扩展侧边栏选择目录；X 源目录授权入口已迁移" });
+      return false;
     }
     if (message?.type === "xposter:clear-vault") {
       clearVault().then(sendResponse);
@@ -989,31 +955,8 @@
     return false;
   });
 
-  async function getVaultStatus() {
-    try {
-      const record = await shared.getVaultRecord();
-      if (!record?.handle) return { configured: false };
-      return {
-        configured: true,
-        name: record.name || record.handle.name || "Selected folder",
-        permission: await shared.queryReadPermission(record.handle),
-        savedAt: record.savedAt || null
-      };
-    } catch {
-      return { configured: false };
-    }
-  }
-
-  async function clearVault() {
-    try {
-      await shared.clearVaultHandle();
-      showStatus("Local image folder cleared", "done", 3000);
-      return { ok: true };
-    } catch (error) {
-      return { ok: false, error: error?.message || String(error) };
-    }
-  }
-
+  async function getVaultStatus() { return { configured: false, extensionOnly: true }; }
+  async function clearVault() { return { ok: true }; }
   async function collectDiagnostics() {
     const vault = await getVaultStatus();
     const main = await diagnoseMainWorld();
@@ -1045,13 +988,13 @@
         resolve(value);
       };
       const listener = (event) => {
-        if (event.source !== window || event.data?.source !== CHANNEL_FROM_MAIN) return;
+        if (event.source !== window || event.origin !== location.origin || event.data?.source !== CHANNEL_FROM_MAIN) return;
         if (event.data.kind !== "diagnostics") return;
         state.mainReady = true;
         finish(event.data.payload || { ok: true });
       };
       window.addEventListener("message", listener);
-      window.postMessage({ source: CHANNEL_TO_MAIN, kind: "diagnostics" }, "*");
+      window.postMessage({ source: CHANNEL_TO_MAIN, kind: "diagnostics" }, location.origin);
       window.setTimeout(() => finish({ ok: false, error: "MAIN world bridge timeout" }), 2500);
     });
   }
