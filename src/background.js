@@ -197,8 +197,15 @@ function isRetryableRemoteImageResult(result) {
   const status = Number(result?.status || 0);
   return (
     [429, 500, 502, 503, 504].includes(status) ||
-    /fetch failed|network|SSL|timed out|timeout/i.test(String(result?.error || ""))
+    ["NETWORK_ERROR", "TIMEOUT"].includes(result?.code)
   );
+}
+
+function remoteImageErrorCode(reason, status) {
+  if (status) return "HTTP_ERROR";
+  if (/timed out|timeout/i.test(reason)) return "TIMEOUT";
+  if (/failed to fetch|fetch failed|network|SSL|load failed/i.test(reason)) return "NETWORK_ERROR";
+  return "INVALID_IMAGE";
 }
 
 let activeDownloads = 0;
@@ -348,16 +355,18 @@ function remoteImageFetchError(url, reason, status = null, details = {}) {
     origin = new URL(url).origin;
   } catch {}
   const normalized = security.uiError(reason || "图片下载失败");
+  const code = remoteImageErrorCode(String(reason || ""), status);
   const unavailable =
     status === 401 ||
     status === 403 ||
     status === 404 ||
-    /fetch failed|network|SSL|timed out|timeout/i.test(normalized);
+    ["NETWORK_ERROR", "TIMEOUT"].includes(code);
   const hint = unavailable
-    ? `xPoster has permission, but Chrome could not download this image from ${origin}. The signed image URL may be private, expired, blocked, or temporarily unreachable.${details.retriedSignedUrl ? " xPoster also retried this COS-style signed URL without unsigned response-* query parameters." : ""} Open the image URL in a normal tab; if it does not load there, regenerate a public image link and click Check downloads again.`
+    ? `xPoster has permission, but Chrome could not download this image from ${origin}. Possible causes include network/TLS errors, blocked redirects, or source-site restrictions.${details.retriedSignedUrl ? " Retried without unsigned response-* parameters." : ""} Open the URL in a tab; if it loads, retry Check downloads or save it as a local image.`
     : `xPoster has permission, but ${origin} did not return a usable image file.`;
   return {
     ok: false,
+    code,
     status,
     origin,
     error: `${normalized}. ${hint}`

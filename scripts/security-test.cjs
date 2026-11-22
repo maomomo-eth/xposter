@@ -109,6 +109,51 @@ function check(fn) { fn(); checks++; }
   check(() => assert.equal(options.redirect, 'error'));
   check(() => assert.equal(options.credentials, 'omit'));
   check(() => assert.equal(options.targetAddressSpace, undefined));
+  // Chrome 的真实错误顺序是 Failed to fetch；首次失败后应恢复并缓存图片。
+  let attempts = 0;
+  worker.fetch = async () => {
+    attempts++;
+    if (attempts === 1) throw new TypeError('Failed to fetch');
+    return new Response(png, { headers: { 'content-type': 'image/png' } });
+  };
+  assert.equal((await vm.runInContext('probeImage("https://images.real.site/transient.png")', worker)).ok, true); checks++;
+  check(() => assert.equal(attempts, 2));
+  assert.equal((await vm.runInContext('fetchImage("https://images.real.site/transient.png")', worker)).cacheHit, true); checks++;
+  check(() => assert.equal(attempts, 2));
+  for (const message of ['Failed to fetch', 'fetch failed', 'NetworkError when attempting to fetch resource.', 'Load failed', 'Image fetch timed out']) {
+    attempts = 0;
+    worker.fetch = async () => { attempts++; throw new TypeError(message); };
+    const failure = await vm.runInContext('probeImage("https://images.real.site/unreachable.png?token=SECRET")', worker);
+    check(() => assert.equal(attempts, 2));
+    check(() => assert.equal(failure.ok, false));
+    check(() => assert.equal(failure.code, /timed out/.test(message) ? 'TIMEOUT' : 'NETWORK_ERROR'));
+    check(() => assert.ok(failure.error.includes('Chrome could not download')));
+    check(() => assert.ok(!/SECRET|did not return a usable image/.test(failure.error)));
+  }
+  for (const status of [403, 429, 503]) {
+    attempts = 0;
+    worker.fetch = async () => { attempts++; return new Response(null, { status }); };
+    const failure = await vm.runInContext('probeImage("https://images.real.site/http.png")', worker);
+    check(() => assert.equal(failure.code, 'HTTP_ERROR'));
+    check(() => assert.equal(failure.status, status));
+    check(() => assert.equal(attempts, status === 403 ? 1 : 2));
+  }
+  attempts = 0;
+  worker.fetch = async () => { attempts++; return new Response('not an image', { headers: { 'content-type': 'image/png' } }); };
+  const invalid = await vm.runInContext('probeImage("https://images.real.site/invalid.png")', worker);
+  check(() => assert.equal(invalid.code, 'INVALID_IMAGE'));
+  check(() => assert.equal(attempts, 1));
+  // 签名链接的修复仍先于整个下载流程的网络重试。
+  const urls = [];
+  worker.fetch = async request => {
+    urls.push(request.url);
+    return urls.length === 1 ? new Response(null, { status: 403 }) : new Response(png, { headers: { 'content-type': 'image/png' } });
+  };
+  const repaired = await vm.runInContext('probeImage("https://images.real.site/signed.png?q-signature=SECRET&response-content-type=image/png")', worker);
+  check(() => assert.equal(repaired.ok, true));
+  check(() => assert.equal(repaired.repairedSignedUrl, true));
+  check(() => assert.equal(urls.length, 2));
+  check(() => assert.ok(!urls[1].includes('response-content-type')));
   assert.equal((await vm.runInContext('fetchImage("data:image/png;base64,c2VjcmV0")', worker)).ok, false); checks++;
   await vm.runInContext('draftQueue', worker);
   const records = { xposter_sidepanel_draft: '升级前旧草稿' };

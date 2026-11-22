@@ -1704,14 +1704,11 @@ console.log("示例代码块");
       const segment = images[index];
       const source = remoteImageProbeKey(segment);
       let result = null;
-      for (let attempt = 1; attempt <= 1; attempt += 1) {
-        try {
-          result = await chrome.runtime.sendMessage({ type: "xposter:probe-image", url: source });
-        } catch (error) {
-          result = { ok: false, error: error?.message || String(error) };
-        }
-        if (result?.ok || !isRetryableRemoteImageProbeError(result?.error) || attempt === 4) break;
-        await delay(800 * attempt * attempt);
+      // 下载重试由后台统一处理，侧栏只发送一次检查请求。
+      try {
+        result = await chrome.runtime.sendMessage({ type: "xposter:probe-image", url: source });
+      } catch (error) {
+        result = { ok: false, error: error?.message || String(error) };
       }
       const item = {
         index: index + 1,
@@ -1758,12 +1755,8 @@ console.log("示例代码块");
       origin = new URL(item.source).origin;
     } catch {}
     const fileName = item.fileName || `image-${item.index}`;
-    const error = item.error || "Image download failed";
+    const error = (item.error || "Image download failed").replace(/[.\s]+$/, "");
     return `Image ${item.index} failed (${fileName}) from ${origin}: ${error}. xPoster recognized the Markdown image, but it will not write image links into X as real uploads until this file can be downloaded.`;
-  }
-
-  function isRetryableRemoteImageProbeError(error) {
-    return /fetch failed|timed out|timeout|network|HTTP 429|HTTP 500|HTTP 502|HTTP 503|HTTP 504/i.test(String(error || ""));
   }
 
   function ensureLatestParsedFromDraft() {

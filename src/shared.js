@@ -70,10 +70,10 @@
     const titleFromMeta = meta.title || meta.Title || meta["标题"] || null;
     let cover = meta.cover || meta.Cover || meta["封面"] || null;
     if (cover) {
-      cover = cover
-        .replace(/^!\[\[|\]\]$/g, "")
-        .replace(/^!\[[^\]]*\]\(([^)]+)\)$/u, "$1")
-        .trim();
+      const image = findMarkdownImageSpans(cover)[0];
+      cover = image?.start === 0 && image.end === cover.length
+        ? image.source
+        : cover.replace(/^!\[\[|\]\]$/g, "").trim();
     }
 
     const spans = findSpecialBlocks(body);
@@ -224,7 +224,7 @@
         start,
         end: sourceEnd + 1,
         alt: markdown.slice(start + 2, altEnd),
-        source: markdown.slice(sourceStart, sourceEnd).trim()
+        source: parseMarkdownImageSource(markdown.slice(sourceStart, sourceEnd))
       });
       cursor = sourceEnd + 1;
     }
@@ -240,9 +240,24 @@
 
   function findMarkdownClosingParen(markdown, start) {
     let depth = 0;
+    let quote = null;
+    let angle = markdown[start] === "<";
     for (let index = start; index < markdown.length; index += 1) {
       const char = markdown[index];
       if (isEscaped(markdown, index)) continue;
+      if (angle) {
+        if (char === ">") angle = false;
+        continue;
+      }
+      if (quote) {
+        if (char === quote) quote = null;
+        continue;
+      }
+      // 只有目标之后的引号才开启标题，URL 内的单引号保持原样。
+      if (depth === 0 && /\s/.test(markdown[index - 1] || "") && (char === '"' || char === "'")) {
+        quote = char;
+        continue;
+      }
       if (char === "(") {
         depth += 1;
         continue;
@@ -252,6 +267,14 @@
       depth -= 1;
     }
     return -1;
+  }
+
+  function parseMarkdownImageSource(value) {
+    const text = value.trim();
+    // 标题属于 Markdown 语法，不能拼进请求地址；保留签名查询参数原样。
+    const titled = text.match(/^([\s\S]*?)\s+(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\((?:\\.|[^)\\])*\))$/);
+    const source = (titled ? titled[1] : text).trim();
+    return source.replace(/^<([\s\S]*)>$/, "$1").replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g, "$1");
   }
 
   function isEscaped(text, index) {
