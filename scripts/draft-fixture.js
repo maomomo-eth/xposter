@@ -40,25 +40,41 @@
     static moveSelectionToEnd(state) { return state; }
     static forceSelection(state, selection) { return new EditorState(state.content, selection); }
   }
-  let node;
+  let node, externalRevision = 0;
   function render() { document.querySelector('.public-DraftEditor-content').textContent = node.props.editorState.getCurrentContent().getPlainText(); }
   function install(text = '原正文', options = {}) {
     const block = new Block({ text });
-    node = { props: { editorState: new EditorState(new Content(BlockMap([[block.key, block]]))), onChange(state) { node.props.editorState = state; render(); options.onChange?.(state); }, onFilesAdded() {
+    node = { props: { editorState: new EditorState(new Content(BlockMap([[block.key, block]]))), onChange(state) {
+      const target = node, revision = externalRevision;
+      const commit = () => {
+        if (node !== target || revision !== externalRevision || options.dropChanges) return;
+        node.props.editorState = state; refreshUploadHandler(); render(); options.onChange?.(state);
+      };
+      if (options.commitDelay) setTimeout(commit, options.commitDelay); else commit();
+    }, onFilesAdded(files, selection = node.props.editorState.getSelection()) {
       window.fixtureUploading = true;
+      window.fixtureUploads.push({ key: selection.key, text: node.props.editorState.getCurrentContent().getBlockMap().get(selection.key)?.getText(), name: files[0]?.name });
       setTimeout(() => {
-        const old = node.props.editorState; let content = old.getCurrentContent(); const key = old.getSelection().key;
+        const old = node.props.editorState; let content = old.getCurrentContent(); const key = selection.key;
         const marker = content.getBlockMap().get(key);
         content = content.createEntity('MEDIA', 'IMMUTABLE', { mediaItems: [{ mediaId: '987654321' }] });
-        const next = marker.merge({ type: 'atomic', text: ' ', characterList: List([new Character(content.getLastCreatedEntityKey())]) });
-        node.props.onChange(EditorState.push(old, content.set('blockMap', content.getBlockMap().set(key, next))));
+        const mediaKey = options.appendMedia ? `media_${content.getLastCreatedEntityKey()}` : key;
+        const next = marker.merge({ key: mediaKey, type: 'atomic', text: ' ', characterList: List([new Character(content.getLastCreatedEntityKey())]) });
+        node.props.onChange(EditorState.push(old, content.set('blockMap', content.getBlockMap().set(mediaKey, next))));
       }, options.uploadDelay || 500);
     } } };
+    const upload = node.props.onFilesAdded;
+    function refreshUploadHandler() {
+      if (!options.captureUploadSelection) return;
+      const selection = node.props.editorState.getSelection();
+      node.props.onFilesAdded = files => upload(files, selection);
+    }
+    refreshUploadHandler();
     const editor = document.querySelector('.public-DraftEditor-content');
     editor.__reactFiber$fixture = { stateNode: node };
     editor.oninput = () => external(editor.textContent);
-    render(); window.fixtureUploading = false;
+    render(); window.fixtureUploading = false; window.fixtureUploads = [];
   }
-  function external(text) { const state = node.props.editorState; const blocks = state.content.blocks; const key = blocks.entries.find(([, b]) => b.type !== 'atomic')?.[0]; if (!key) return; const block = blocks.get(key).merge({ text, characterList: List(Array.from(text, () => new Character())) }); node.props.editorState = EditorState.push(state, state.content.set('blockMap', blocks.set(key, block))); render(); }
+  function external(text) { externalRevision++; const state = node.props.editorState; const blocks = state.content.blocks; const key = blocks.entries.find(([, b]) => b.type !== 'atomic')?.[0]; if (!key) return; const block = blocks.get(key).merge({ text, characterList: List(Array.from(text, () => new Character())) }); node.props.editorState = EditorState.push(state, state.content.set('blockMap', blocks.set(key, block))); render(); }
   window.testDraft = { install, external, node: () => node };
 })();

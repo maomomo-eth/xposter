@@ -50,10 +50,33 @@
     // 即使没有 trusted 输入事件，程序替换正文也必须核对内容；选择状态变化可保留。
     const records = contentRecords(content);
     const seeded = activeSession.seed && content.getPlainText?.() === "x" && records.size === 1 && content.getBlockMap().find(block => block.getType() === "unstyled" && block.getText() === "x");
-    if (!sameRecords(records, activeSession.records) && !seeded && !(activeSession.upload && allowedUpload(content, activeSession.upload))) throw new Error("正文版本已变化，导入取消");
+    const ownWrite = activeSession.write && sameRecords(records, activeSession.write.records);
+    if (!sameRecords(records, activeSession.records) && !ownWrite && !seeded && !(activeSession.upload && allowedUpload(content, activeSession.upload))) throw new Error("正文版本已变化，导入取消");
     activeSession.content = content; activeSession.records = records;
   }
-  function changeDraft(node, state) { assertContext(); node.props.onChange(state); acceptContent(node, state.getCurrentContent()); }
+  async function changeDraft(node, state) {
+    assertContext();
+    if (activeSession.write) throw new Error("上一笔正文写入尚未确认");
+    const pending = { records: contentRecords(state.getCurrentContent()) };
+    activeSession.write = pending;
+    try {
+      // onChange 只提交更新请求；React 回写 props 后才承认本次正文和选区已生效。
+      node.props.onChange(state);
+      const deadline = Date.now() + 4000;
+      while (Date.now() < deadline) {
+        assertContext();
+        const actual = node.props.editorState;
+        const selection = actual.getSelection();
+        const expectedSelection = state.getSelection();
+        const selectionReady = selection === expectedSelection || selection.equals?.(expectedSelection);
+        if (sameRecords(activeSession.records, pending.records) && selectionReady) return;
+        await sleep(25);
+      }
+      throw new Error("X 编辑器未确认正文或选区写入，导入已停止");
+    } finally {
+      if (activeSession.write === pending) activeSession.write = null;
+    }
+  }
   const LOG = "[xPoster MAIN]";
   const CHANNEL_TO_MAIN = "xposter";
   const CHANNEL_FROM_MAIN = "xposter-main";
@@ -211,7 +234,7 @@
     return findDraftStateNode() || draftNode;
   }
 
-  function writeDraftBlocks(draftNode, blocks) {
+  async function writeDraftBlocks(draftNode, blocks) {
     if (!Array.isArray(blocks) || !blocks.length) return { ok: false, error: "No structured blocks" };
 
     const editorState = draftNode.props.editorState;
@@ -287,7 +310,7 @@
       .set("selectionAfter", selection);
     let nextEditorState = EditorState.push(editorState, nextState, "insert-fragment");
     nextEditorState = EditorState.moveSelectionToEnd(nextEditorState);
-    changeDraft(draftNode, nextEditorState);
+    await changeDraft(draftNode, nextEditorState);
     return { ok: true, blocks: createdKeys.length };
   }
 
@@ -365,7 +388,7 @@
     return { ok: true, entityKey, contentState: withEntity.set("blockMap", blockMap) };
   }
 
-  function insertAtomicBatch(draftNode, operations) {
+  async function insertAtomicBatch(draftNode, operations) {
     if (!operations.length) return { okCount: 0, failCount: 0, errors: [] };
     const editorState = draftNode.props.editorState;
     const EditorState = editorState.constructor;
@@ -398,7 +421,7 @@
       const nextContent = contentState.set("selectionBefore", selection).set("selectionAfter", selection);
       let nextEditorState = EditorState.push(editorState, nextContent, "insert-fragment");
       nextEditorState = EditorState.moveSelectionToEnd(nextEditorState);
-      changeDraft(draftNode, nextEditorState);
+      await changeDraft(draftNode, nextEditorState);
     }
 
     return { okCount, failCount: errors.length, errors };
@@ -429,7 +452,7 @@
     return entities;
   }
 
-  function placeSelectionAtMarker(draftNode, marker) {
+  async function placeSelectionAtMarker(draftNode, marker) {
     const editorState = draftNode.props.editorState;
     const SelectionState = editorState.getSelection().constructor;
     const EditorState = editorState.constructor;
@@ -437,15 +460,14 @@
     const blockKey = findMarkerBlock(contentState, marker);
     if (!blockKey) return false;
     const selection = SelectionState.createEmpty(blockKey).merge({ anchorOffset: 0, focusOffset: 0 });
-    changeDraft(draftNode, EditorState.forceSelection(editorState, selection));
+    await changeDraft(draftNode, EditorState.forceSelection(editorState, selection));
     return true;
   }
 
   async function uploadImageAtMarker(draftNode, imageOperation, existingAtomicBlocks) {
-    const onFilesAdded = findOnFilesAdded();
-    if (!onFilesAdded) return { ok: false, error: "X upload handler was not reachable" };
+    if (!findOnFilesAdded()) return { ok: false, error: "X upload handler was not reachable" };
 
-    if (!placeSelectionAtMarker(draftNode, imageOperation.marker)) {
+    if (!await placeSelectionAtMarker(draftNode, imageOperation.marker)) {
       return { ok: false, error: "Image placeholder was not found in the X editor" };
     }
     await sleep(80);
@@ -455,6 +477,9 @@
     const file = base64ToFile(preparedFile.base64, preparedFile.fileName, preparedFile.mime);
 
     assertContext();
+    // 选区提交会触发 React 重新渲染，调用此刻的上传回调。
+    const onFilesAdded = findOnFilesAdded();
+    if (!onFilesAdded) return { ok: false, error: "X upload handler was not reachable" };
     activeSession.upload = { markerKey: findMarkerBlock(activeSession.content, imageOperation.marker), records: new Map(activeSession.records) };
     onFilesAdded([file]);
     const deadline = Date.now() + 45000;
@@ -495,7 +520,7 @@
     return { ok: false, error: "Timed out waiting for X media upload" };
   }
 
-  function replaceMarkerText(draftNode, marker, text) {
+  async function replaceMarkerText(draftNode, marker, text) {
     const editorState = draftNode.props.editorState;
     const EditorState = editorState.constructor;
     const SelectionState = editorState.getSelection().constructor;
@@ -513,11 +538,11 @@
       .set("blockMap", blockMap.set(blockKey, nextBlock))
       .set("selectionBefore", selection)
       .set("selectionAfter", selection);
-    changeDraft(draftNode, EditorState.push(editorState, nextContent, "change-block-data"));
+    await changeDraft(draftNode, EditorState.push(editorState, nextContent, "change-block-data"));
     return true;
   }
 
-  function relocateImages(draftNode, uploads, protectedAtomicBlocks) {
+  async function relocateImages(draftNode, uploads, protectedAtomicBlocks) {
     if (!uploads.length) return { moved: 0, missing: 0 };
     const editorState = draftNode.props.editorState;
     const EditorState = editorState.constructor;
@@ -586,7 +611,8 @@
       else if (!destinationBlocks.has(key)) orderedKeys.push(key);
     });
 
-    let nextBlockMap = blockMap.constructor();
+    const BlockMap = blockMap.constructor;
+    let nextBlockMap = BlockMap();
     for (const key of orderedKeys) nextBlockMap = nextBlockMap.set(key, blockMap.get(key));
     const selection = SelectionState.createEmpty(orderedKeys[orderedKeys.length - 1]);
     const nextContent = contentState
@@ -595,11 +621,11 @@
       .set("selectionAfter", selection);
     let nextEditorState = EditorState.push(editorState, nextContent, "remove-range");
     nextEditorState = EditorState.moveSelectionToEnd(nextEditorState);
-    changeDraft(draftNode, nextEditorState);
+    await changeDraft(draftNode, nextEditorState);
     return { moved: moves.size, missing };
   }
 
-  function cleanupMarkers(draftNode, markerPrefix) {
+  async function cleanupMarkers(draftNode, markerPrefix) {
     const editorState = draftNode.props.editorState;
     const EditorState = editorState.constructor;
     const SelectionState = editorState.getSelection().constructor;
@@ -621,14 +647,14 @@
       .set("selectionAfter", selection);
     let nextEditorState = EditorState.push(editorState, nextContent, "remove-range");
     nextEditorState = EditorState.moveSelectionToEnd(nextEditorState);
-    changeDraft(draftNode, nextEditorState);
+    await changeDraft(draftNode, nextEditorState);
     return toDelete.length;
   }
 
-  function kickRender(draftNode) {
+  async function kickRender(draftNode) {
     try {
       const EditorState = draftNode.props.editorState.constructor;
-      changeDraft(draftNode, EditorState.moveSelectionToEnd(draftNode.props.editorState));
+      await changeDraft(draftNode, EditorState.moveSelectionToEnd(draftNode.props.editorState));
     } catch (error) {
       console.warn(LOG, "render kick failed", error);
     }
@@ -696,7 +722,7 @@
     });
   }
 
-  function deleteBlockByKey(draftNode, blockKey) {
+  async function deleteBlockByKey(draftNode, blockKey) {
     if (!blockKey) return { ok: false, error: "Missing block key" };
     const editorState = draftNode.props.editorState;
     const EditorState = editorState.constructor;
@@ -713,7 +739,7 @@
       .set("selectionAfter", selection);
     let nextEditorState = EditorState.push(editorState, nextContent, "remove-range");
     nextEditorState = EditorState.moveSelectionToEnd(nextEditorState);
-    changeDraft(draftNode, nextEditorState);
+    await changeDraft(draftNode, nextEditorState);
     return { ok: true };
   }
 
@@ -783,7 +809,7 @@
     while (snapshots.size > 3) snapshots.delete(snapshots.keys().next().value);
     progress("Pasting structured Markdown...");
     draftNode = await ensureDraftCharacterSample(draftNode);
-    const writeResult = writeDraftBlocks(draftNode, payload.blocks);
+    const writeResult = await writeDraftBlocks(draftNode, payload.blocks);
     if (!writeResult.ok) {
       console.warn(LOG, "structured block write failed; falling back to paste", writeResult.error);
       throw new Error("结构化写入失败，已保留恢复快照：" + writeResult.error);
@@ -824,7 +850,7 @@
     if (atomicOps.length) {
       progress(`Inserting ${atomicOps.length} special block(s)...`);
       draftNode = findDraftStateNode() || draftNode;
-      const result = insertAtomicBatch(draftNode, atomicOps);
+      const result = await insertAtomicBatch(draftNode, atomicOps);
       summary.atomicOk = result.okCount;
       summary.atomicFail = result.failCount;
       if (result.errors?.length) console.warn(LOG, "atomic failures", result.errors);
@@ -870,7 +896,7 @@
           fileName: op.op.file?.fileName || null,
           error: result.error || "Image upload failed"
         });
-        replaceMarkerText(draftNode, op.marker, op.op.fallbackText || "[image upload failed]");
+        await replaceMarkerText(draftNode, op.marker, op.op.fallbackText || "[image upload failed]");
         console.warn(LOG, "image failed", result.error);
       }
       draftNode = findDraftStateNode() || draftNode;
@@ -879,7 +905,7 @@
     if (uploads.length) {
       progress("Reordering uploaded media...");
       await sleep(900);
-      const result = relocateImages(draftNode, uploads, protectedAtomicBlocks);
+      const result = await relocateImages(draftNode, uploads, protectedAtomicBlocks);
       summary.relocatedImages = result.moved;
       await sleep(400);
     }
@@ -925,8 +951,8 @@
     }
 
     progress("Cleaning up import markers...");
-    summary.markersCleaned += cleanupMarkers(draftNode, payload.markerPrefix);
-    kickRender(draftNode);
+    summary.markersCleaned += await cleanupMarkers(draftNode, payload.markerPrefix);
+    await kickRender(draftNode);
     await sleep(250);
     post("done", { summary });
   }
