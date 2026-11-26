@@ -5610,6 +5610,7 @@ console.log("示例代码块");
     if (replies.some(reply => !reply?.ok)) { log("文章正在导入或无法确认清理，请稍后重试"); return; }
     const cache = await chrome.runtime.sendMessage({ type: "xposter:clear-cache" });
     if (!cache?.ok) { log(cache?.error || "暂时无法清理下载缓存"); return; }
+    await chrome.runtime.sendMessage({ type: "xposter:clear-remote-image-cache" }).catch(() => {});
     clearTimeout(draftTimer);
     const cleared = await chrome.runtime.sendMessage({ type: "xposter:draft", action: "clear" });
     if (!cleared?.ok) { log("草稿清理失败"); return; }

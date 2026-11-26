@@ -263,10 +263,12 @@
     showStatus("Preparing Markdown...", "work");
     try {
       if (!isArticleRoute()) throw new Error("Open X Articles first");
+      if (editorReadOnly()) throw new Error("Current article editor is read-only (published article)");
       if (expectedTarget && expectedTarget !== location.href) throw new Error("目标标签页已变化");
       if (origin !== "paste" && !findEditor()) {
         await ensureEditorReadyForFileImport();
       }
+      if (editorReadOnly()) throw new Error("Current article editor is read-only (published article)");
       if (typeof markdown !== "string" || markdown.length > 1024 * 1024) throw new Error("Markdown 超出 1 MiB 限制");
       const targetUrl = location.href;
       const version = contentVersion();
@@ -282,11 +284,25 @@
 
       if (!(await waitForMainReady())) throw new Error("X editor bridge is not ready");
 
+      const coverSource = String(limitedParsed.cover || "").trim();
+      const coverAlreadyInBody = coverSource && segments.some(
+        (segment) => segment.type === "image" && shared.imageSourcesMatch(segment.source, coverSource)
+      );
+      const coverSegment = coverSource && !coverAlreadyInBody
+        ? { type: "image", source: coverSource, alt: "cover" }
+        : null;
+
       const localImages = segments.filter((segment) => segment.type === "image" && shared.isLocalImageSource(segment.source));
+      if (coverSegment && shared.isLocalImageSource(coverSegment.source)) {
+        localImages.push(coverSegment);
+      }
       if (localImages.length) {
         await ensureVaultForLocalImages(localImages.length);
       }
       const remoteImages = segments.filter((segment) => segment.type === "image" && isRemoteHttpImageSource(segment.source));
+      if (coverSegment && isRemoteHttpImageSource(coverSegment.source)) {
+        remoteImages.push(coverSegment);
+      }
       if (remoteImages.length) {
         const permission = await verifyRemoteImagePermissions(remoteImages);
         if (!permission.ok) {
@@ -298,22 +314,42 @@
       }
 
       const imageMap = await prepareImages(segments);
-      const tableMap = await prepareTables(segments, [...imageMap.values()].reduce((sum, file) => sum + (file.bytes || 0), 0));
-      const mediaFailures = collectMediaFailures(imageMap, "image").concat(collectMediaFailures(tableMap, "table"));
+      let coverResult = null;
+      if (coverSegment) {
+        const coverMap = await prepareImages([coverSegment]);
+        coverResult = coverMap.get(coverSegment) || null;
+      }
+      const tableMap = await prepareTables(
+        segments,
+        [...imageMap.values()].reduce((sum, file) => sum + (file.bytes || 0), 0) + (coverResult?.bytes || 0)
+      );
+      const mediaFailures = collectMediaFailures(imageMap, "image")
+        .concat(coverResult && !coverResult.ok ? collectMediaFailures(new Map([[coverSegment, coverResult]]), "cover") : [])
+        .concat(collectMediaFailures(tableMap, "table"));
       if (mediaFailures.length) {
         const error = new Error(formatMediaFailureMessage(mediaFailures));
         error.mediaFailures = mediaFailures;
         throw error;
       }
-      let totalBytes = 0;
+      let totalBytes = (coverResult?.bytes || 0);
       for (const file of [...imageMap.values(), ...tableMap.values()]) { totalBytes += file.bytes || Math.ceil((file.base64 || "").length * 0.75); }
       if (totalBytes > security.MAX_TOTAL) throw new Error("文章图片总量超过 64 MiB");
       assertTarget(targetUrl, version);
-      const pastePlan = shared.buildPastePlan(segments, imageMap, tableMap);
+      const pastePlan = shared.buildPastePlan(segments, imageMap, tableMap, {
+        coverSource,
+        coverResult
+      });
       const filePayloads = streamImageFilesForMain(pastePlan);
       pastePlan.title = limitedParsed.title || null;
-      pastePlan.cover = limitedParsed.cover || null;
-      for (const item of pastePlan.plan) { if (item.op.source) { if (item.op.source === pastePlan.cover) pastePlan.cover = item.marker; item.op.source = item.marker; } }
+      pastePlan.cover = coverSource || null;
+      for (const item of pastePlan.plan) {
+        if (item.op.source) {
+          if (item.op.source === pastePlan.cover || shared.imageSourcesMatch(item.op.source, pastePlan.cover)) {
+            pastePlan.cover = item.marker;
+          }
+          item.op.source = item.marker;
+        }
+      }
       if (!pastePlan.plan.some(item => item.marker === pastePlan.cover)) pastePlan.cover = null;
       pastePlan.origin = origin;
       pastePlan.targetUrl = targetUrl;
@@ -666,6 +702,11 @@
     const editor = document.querySelector(".public-DraftEditor-content");
     return editor && editor.getBoundingClientRect().width > 200 ? editor : null;
   }
+
+  function editorReadOnly(editor = findEditor()) {
+    return Boolean(editor) && editor.getAttribute("contenteditable") !== "true";
+  }
+
 
   function waitForEditor(timeoutMs) {
     return new Promise((resolve) => {

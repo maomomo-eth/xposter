@@ -13,6 +13,12 @@ chrome.runtime.onInstalled.addListener(async () => {
   await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 });
 
+chrome.permissions?.onRemoved?.addListener((permissions) => {
+  if (!permissions?.origins?.length) return;
+  clearRemoteImageCache();
+});
+
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "xposter:draft" && sender.url?.startsWith(chrome.runtime.getURL(""))) { draftOperation(message).then(sendResponse).catch(() => sendResponse({ ok: false, error: "草稿操作失败" })); return true; }
   if (message?.type === "xposter:clear-cache" && sender.url?.startsWith(chrome.runtime.getURL(""))) { if (activeDownloads || downloadQueue.length) { sendResponse({ ok: false, error: "图片下载正在进行，请稍后清空" }); return false; } remoteImageCache.clear(); remoteImageCacheBytes = 0; sendResponse({ ok: true }); return false; }
@@ -35,6 +41,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .then(sendResponse)
       .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
+  }
+
+  if (message?.type === "xposter:clear-remote-image-cache") {
+    clearRemoteImageCache();
+    sendResponse({ ok: true });
+    return false;
   }
 
   if (message?.type === "xposter:open-side-panel") {
@@ -191,6 +203,11 @@ function rememberRemoteImage(url, payload) {
   while (remoteImageCacheBytes > MAX_REMOTE_IMAGE_CACHE_BYTES && remoteImageCache.size) {
     forgetCachedRemoteImage(remoteImageCache.keys().next().value);
   }
+}
+
+function clearRemoteImageCache() {
+  remoteImageCache.clear();
+  remoteImageCacheBytes = 0;
 }
 
 function isRetryableRemoteImageResult(result) {

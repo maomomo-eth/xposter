@@ -65,7 +65,7 @@
     return { body: normalized.slice(match[0].length).trim(), meta };
   }
 
-  function parseMarkdown(markdown) {
+  function parseMarkdown(markdown, options = {}) {
     const { body, meta } = parseFrontmatter(markdown);
     const titleFromMeta = meta.title || meta.Title || meta["标题"] || null;
     let cover = meta.cover || meta.Cover || meta["封面"] || null;
@@ -73,20 +73,20 @@
       const image = findMarkdownImageSpans(cover)[0];
       cover = image?.start === 0 && image.end === cover.length
         ? image.source
-        : cover.replace(/^!\[\[|\]\]$/g, "").trim();
+        : cover.replace(/^!\[\[|\]\]$/g, "").replace(/\|.*$/, "").trim();
     }
 
-    const spans = findSpecialBlocks(body);
+    const spans = findSpecialBlocks(body, options);
     const segments = [];
     let cursor = 0;
     for (const span of spans) {
       if (span.start > cursor) {
-        segments.push(...parseTextBlocks(body.slice(cursor, span.start)));
+        segments.push(...parseTextBlocks(body.slice(cursor, span.start), options));
       }
       segments.push(span.segment);
       cursor = span.end;
     }
-    if (cursor < body.length) segments.push(...parseTextBlocks(body.slice(cursor)));
+    if (cursor < body.length) segments.push(...parseTextBlocks(body.slice(cursor), options));
 
     let title = titleFromMeta;
     if (!title) {
@@ -112,29 +112,129 @@
     };
   }
 
+  function markdownLineRecords(markdown) {
+    const lines = [];
+    let start = 0;
+    while (start < markdown.length) {
+      let end = markdown.indexOf("\n", start);
+      if (end < 0) end = markdown.length;
+      lines.push({
+        start,
+        end: end < markdown.length ? end + 1 : end,
+        text: markdown.slice(start, end)
+      });
+      start = end + 1;
+    }
+    return lines;
+  }
+
+  function isIndentedCodeLine(line) {
+    return /^ {4}\S|^\t\S/.test(line?.text || "");
+  }
+
+  function unindentCodeLine(line) {
+    return (line?.text || "").replace(/^ {4}|^\t/, "");
+  }
+
+  function isBlankLineInsideIndentedCode(lines, index) {
+    if (!/^\s*$/.test(lines[index]?.text || "")) return false;
+    for (let i = index + 1; i < lines.length; i += 1) {
+      if (isIndentedCodeLine(lines[i])) return true;
+      if (!/^\s*$/.test(lines[i].text)) return false;
+    }
+    return false;
+  }
+
+  function opensIndentedCode(lines, index) {
+    if (!isIndentedCodeLine(lines[index])) return false;
+    const prev = lines[index - 1];
+    return !prev || /^\s*$/.test(prev.text);
+  }
+
+  function findFencedCodeSpans(markdown) {
+    const spans = [];
+    const opener = /^(?: {0,3})(`{3,}|~{3,})([^\n]*)$/gm;
+    let match;
+    while ((match = opener.exec(markdown)) !== null) {
+      const marker = match[1][0];
+      const markerLength = match[1].length;
+      const contentStart = markdown[opener.lastIndex] === "\n" ? opener.lastIndex + 1 : opener.lastIndex;
+      const closer = new RegExp(`^(?: {0,3})${marker}{${markerLength},}[ \\t]*$`, "gm");
+      closer.lastIndex = contentStart;
+      const close = closer.exec(markdown);
+      if (!close) continue;
+      spans.push({
+        start: match.index,
+        end: close.index + close[0].length,
+        segment: {
+          type: "code",
+          language: (match[2] || "").trim(),
+          code: markdown.slice(contentStart, close.index).replace(/\n$/, "")
+        }
+      });
+      opener.lastIndex = close.index + close[0].length;
+    }
+    return spans;
+  }
+
+  function findIndentedCodeSpans(markdown) {
+    const lines = markdownLineRecords(markdown);
+    const spans = [];
+    let index = 0;
+    while (index < lines.length) {
+      if (!opensIndentedCode(lines, index)) {
+        index += 1;
+        continue;
+      }
+      const start = lines[index].start;
+      const codeLines = [];
+      let end = lines[index].end;
+      while (index < lines.length) {
+        const line = lines[index];
+        if (isIndentedCodeLine(line)) {
+          codeLines.push(unindentCodeLine(line));
+          end = line.end;
+          index += 1;
+          continue;
+        }
+        if (isBlankLineInsideIndentedCode(lines, index)) {
+          codeLines.push("");
+          end = line.end;
+          index += 1;
+          continue;
+        }
+        break;
+      }
+      spans.push({
+        start,
+        end,
+        segment: {
+          type: "code",
+          language: "",
+          code: codeLines.join("\n").replace(/\n$/, "")
+        }
+      });
+    }
+    return spans;
+  }
+
+  function addNonOverlappingSpan(spans, span) {
+    if (!span || spans.some((existing) => span.start < existing.end && span.end > existing.start)) return;
+    spans.push(span);
+  }
+
   function findSpecialBlocks(markdown) {
     const spans = [];
     let match;
 
-    const fencedCode = /```([^\n`]*)\n([\s\S]*?)```/g;
-    while ((match = fencedCode.exec(markdown)) !== null) {
-      spans.push({
-        start: match.index,
-        end: match.index + match[0].length,
-        segment: {
-          type: "code",
-          language: (match[1] || "").trim(),
-          code: (match[2] || "").replace(/\n$/, "")
-        }
-      });
-    }
+    for (const span of findFencedCodeSpans(markdown)) addNonOverlappingSpan(spans, span);
+    for (const span of findIndentedCodeSpans(markdown)) addNonOverlappingSpan(spans, span);
 
     const table = /^(?:[ \t]*\|.+\|[ \t]*\n)(?:[ \t]*\|[\s:|\-]+\|[ \t]*\n)((?:[ \t]*\|.+\|[ \t]*\n?)*)/gm;
     while ((match = table.exec(markdown)) !== null) {
-      if (overlaps(spans, match.index)) continue;
       const parsed = parseTable(match[0]);
       if (!parsed) continue;
-      spans.push({
+      addNonOverlappingSpan(spans, {
         start: match.index,
         end: match.index + match[0].length,
         segment: { type: "table", ...parsed }
@@ -143,18 +243,16 @@
 
     const divider = /^(?: {0,3})(?:-{3,}|\*{3,}|_{3,})(?:[ \t]*)$/gm;
     while ((match = divider.exec(markdown)) !== null) {
-      if (overlaps(spans, match.index)) continue;
-      spans.push({
+      addNonOverlappingSpan(spans, {
         start: match.index,
         end: match.index + match[0].length,
         segment: { type: "divider" }
       });
     }
 
-    const statusUrl = /^(?: {0,3})https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\/[A-Za-z0-9_]+\/status\/(\d+)(?:[?#][^\s]*)?\s*$/gm;
+    const statusUrl = /^(?: {0,3})https?:\/\/(?:www\.|mobile\.)?(?:x\.com|twitter\.com)\/(?:i\/web|[A-Za-z0-9_]+)\/status\/(\d+)\/?(?:[?#][^\s]*)?\s*$/gm;
     while ((match = statusUrl.exec(markdown)) !== null) {
-      if (overlaps(spans, match.index)) continue;
-      spans.push({
+      addNonOverlappingSpan(spans, {
         start: match.index,
         end: match.index + match[0].length,
         segment: { type: "tweet", tweetId: match[1] }
@@ -162,12 +260,11 @@
     }
 
     for (const image of findMarkdownImageSpans(markdown)) {
-      if (overlaps(spans, image.start)) continue;
       const source = image.source;
       const tweet = source.match(
-        /^https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\/[A-Za-z0-9_]+\/status\/(\d+)/
+        /^https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\/(?:i\/web|[A-Za-z0-9_]+)\/status\/(\d+)/
       );
-      spans.push({
+      addNonOverlappingSpan(spans, {
         start: image.start,
         end: image.end,
         segment: tweet
@@ -178,12 +275,11 @@
 
     const linkedTweet = /^[ \t]*\[([^\]]*)\]\(([^)]+)\)[ \t]*$/gm;
     while ((match = linkedTweet.exec(markdown)) !== null) {
-      if (overlaps(spans, match.index)) continue;
       const tweet = match[2]
         .trim()
-        .match(/^https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\/[A-Za-z0-9_]+\/status\/(\d+)/);
+        .match(/^https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\/(?:i\/web|[A-Za-z0-9_]+)\/status\/(\d+)/);
       if (!tweet) continue;
-      spans.push({
+      addNonOverlappingSpan(spans, {
         start: match.index,
         end: match.index + match[0].length,
         segment: { type: "tweet", tweetId: tweet[1] }
@@ -192,16 +288,22 @@
 
     const obsidianImage = /^[ \t]*!\[\[([^\]]+)\]\][ \t]*$/gm;
     while ((match = obsidianImage.exec(markdown)) !== null) {
-      if (overlaps(spans, match.index)) continue;
-      spans.push({
+      const [source, ...alias] = match[1].split("|");
+      const alt = alias.join("|").trim();
+      addNonOverlappingSpan(spans, {
         start: match.index,
         end: match.index + match[0].length,
-        segment: { type: "image", source: match[1].trim(), alt: "" }
+        segment: {
+          type: "image",
+          source: source.trim(),
+          alt: /^\d+(?:x\d+)?$/i.test(alt) ? "" : alt
+        }
       });
     }
 
     return spans.sort((left, right) => left.start - right.start);
   }
+
 
   function findMarkdownImageSpans(markdown) {
     const spans = [];
@@ -380,15 +482,69 @@
     return segments;
   }
 
-  function parseInline(kind, source) {
-    const result = { type: "text", kind, text: "", inlineStyleRanges: [], links: [] };
-    let cursor = 0;
+  function markdownDelimiterPairs(markdown, open, close) {
+    const pairs = new Map();
+    const stack = [];
+    let backslashRun = 0;
+    for (let index = 0; index < markdown.length; index += 1) {
+      const char = markdown[index];
+      if (char === "\\") {
+        backslashRun += 1;
+        continue;
+      }
+      const escaped = backslashRun % 2 === 1;
+      backslashRun = 0;
+      if (escaped) continue;
+      if (char === open) stack.push(index);
+      else if (char === close && stack.length) pairs.set(stack.pop(), index);
+    }
+    return pairs;
+  }
 
+  function unescapeMarkdownPunctuation(value) {
+    return String(value || "").replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g, "$1");
+  }
+
+  function parseInline(kind, source, options = {}) {
+    const result = { type: "text", kind, text: "", inlineStyleRanges: [], links: [] };
+    const bracketPairs = markdownDelimiterPairs(source, "[", "]");
+    const parenPairs = markdownDelimiterPairs(source, "(", ")");
+    let cursor = 0;
+    let plain = "";
+
+    const appendPlain = () => {
+      if (!plain) return;
+      result.text += plain;
+      plain = "";
+    };
     const appendStyled = (text, styles) => {
+      const value = String(text ?? "");
       const offset = result.text.length;
-      result.text += text;
+      result.text += value;
       for (const style of styles) {
-        result.inlineStyleRanges.push({ offset, length: text.length, style });
+        result.inlineStyleRanges.push({ offset, length: value.length, style });
+      }
+    };
+    const appendNested = (text, styles) => {
+      const inner = parseInline(kind, String(text ?? ""), options);
+      const offset = result.text.length;
+      result.text += inner.text;
+      for (const range of inner.inlineStyleRanges) {
+        result.inlineStyleRanges.push({
+          offset: offset + range.offset,
+          length: range.length,
+          style: range.style
+        });
+      }
+      for (const link of inner.links) {
+        result.links.push({
+          offset: offset + link.offset,
+          length: link.length,
+          url: link.url
+        });
+      }
+      for (const style of styles) {
+        result.inlineStyleRanges.push({ offset, length: inner.text.length, style });
       }
     };
 
@@ -396,12 +552,20 @@
       const char = source[cursor];
 
       if (char === "[") {
-        const link = source.slice(cursor).match(/^\[([^\]]+)\]\(([^)]+)\)/);
-        if (link) {
+        const labelEnd = bracketPairs.get(cursor) ?? -1;
+        const destinationStart = labelEnd + 2;
+        const destinationEnd = labelEnd >= 0 && source[labelEnd + 1] === "("
+          ? parenPairs.get(labelEnd + 1) ?? -1
+          : -1;
+        if (destinationEnd >= 0) {
+          appendPlain();
+          const label = unescapeMarkdownPunctuation(source.slice(cursor + 1, labelEnd));
+          const rawDest = unescapeMarkdownPunctuation(source.slice(destinationStart, destinationEnd));
+          const destination = security?.safeLink ? security.safeLink(rawDest) : rawDest.trim();
           const offset = result.text.length;
-          result.text += link[1];
-          if (security.safeLink(link[2])) result.links.push({ offset, length: link[1].length, url: link[2] });
-          cursor += link[0].length;
+          result.text += label;
+          if (destination) result.links.push({ offset, length: label.length, url: destination });
+          cursor = destinationEnd + 1;
           continue;
         }
       }
@@ -414,19 +578,29 @@
       let matched = false;
       for (const rule of inlineRules) {
         if (!source.startsWith(rule.marker, cursor)) continue;
-        const end = source.indexOf(rule.marker, cursor + rule.marker.length);
+        let end = source.indexOf(rule.marker, cursor + rule.marker.length);
         if (end <= cursor) continue;
-        appendStyled(source.slice(cursor + rule.marker.length, end), rule.styles);
+        while (source[end + rule.marker.length] === rule.marker[0]) end += 1;
+        appendPlain();
+        appendNested(source.slice(cursor + rule.marker.length, end), rule.styles);
         cursor = end + rule.marker.length;
         matched = true;
         break;
       }
       if (matched) continue;
 
-      if ((char === "*" || char === "_") && source[cursor + 1] !== char) {
-        const end = source.indexOf(char, cursor + 1);
-        if (end > cursor && source[end + 1] !== char) {
-          appendStyled(source.slice(cursor + 1, end), ["Italic"]);
+      const wordChar = (value) => /[\p{L}\p{N}]/u.test(value || "");
+      if ((char === "*" || (char === "_" && !wordChar(source[cursor - 1]))) && source[cursor + 1] !== char) {
+        let end = source.indexOf(char, cursor + 1);
+        while (end > cursor && (source[end + 1] === char || source[end - 1] === char)) {
+          let run = end;
+          while (source[run] === char) run += 1;
+          end = source.indexOf(char, run);
+        }
+        if (char === "_") while (end > cursor && wordChar(source[end + 1])) end = source.indexOf("_", end + 1);
+        if (end > cursor + 1) {
+          appendPlain();
+          appendNested(source.slice(cursor + 1, end), ["Italic"]);
           cursor = end + 1;
           continue;
         }
@@ -435,16 +609,18 @@
       if (char === "`") {
         const end = source.indexOf("`", cursor + 1);
         if (end > cursor) {
+          appendPlain();
           appendStyled(source.slice(cursor + 1, end), ["Code"]);
           cursor = end + 1;
           continue;
         }
       }
 
-      result.text += char;
+      plain += char;
       cursor += 1;
     }
 
+    appendPlain();
     return result;
   }
 
@@ -523,7 +699,32 @@
     return lines.join("\n");
   }
 
-  function buildPastePlan(segments, imageResults = new Map(), tableResults = new Map()) {
+  function imageSourcesMatch(left, right) {
+    if (!left || !right) return false;
+    if (left === right) return true;
+    try {
+      const u1 = new URL(left, "https://x.com");
+      const u2 = new URL(right, "https://x.com");
+      return u1.href === u2.href || (u1.origin === u2.origin && u1.pathname === u2.pathname);
+    } catch {
+      return false;
+    }
+  }
+
+  function imageFallback(segment = {}) {
+    const givenAlt = String(segment.alt || "").replace(/[\]\r\n]+/g, " ").trim();
+    const alt = givenAlt || String(guessFileName(segment.source, "image") || "image").replace(/[\]\r\n]+/g, " ").trim() || "image";
+    const source = String(segment.source || "").trim();
+    if (!source || source.startsWith("data:") || !/^https?:\/\//i.test(source)) return { text: `[image unavailable: ${alt}]`, link: "" };
+    return { text: givenAlt || source, link: source };
+  }
+
+  function imageFallbackMarkdown(segment = {}) {
+    const { text, link } = imageFallback(segment);
+    return link ? `[${text}](${link})` : text;
+  }
+
+  function buildPastePlan(segments, imageResults = new Map(), tableResults = new Map(), options = {}) {
     const prefix = `__XPOSTER_${Math.random().toString(36).slice(2, 7)}_`;
     let index = 0;
     const html = [];
@@ -538,7 +739,7 @@
         type: type || "unstyled",
         text: String(text ?? "").replace(/\n+/g, " "),
         inlineStyleRanges: (segment?.inlineStyleRanges || []).map((range) => ({ ...range })),
-        links: (segment?.links || []).filter(link => security.safeLink(link.url)).map((link) => ({ ...link }))
+        links: (segment?.links || []).filter(link => security ? security.safeLink(link.url) : link.url).map((link) => ({ ...link }))
       });
     };
     const flushList = () => {
@@ -546,6 +747,28 @@
       html.push(`<${listTag}>${listItems.map((item) => `<li>${item}</li>`).join("")}</${listTag}>`);
       listTag = null;
       listItems = [];
+    };
+
+    const addImageOperation = (segment, result, meta = {}) => {
+      const id = marker(meta.markerType || "IMAGE");
+      html.push(`<p>${id}</p>`);
+      addBlock("unstyled", id);
+      plan.push({
+        marker: id,
+        op: {
+          type: "image",
+          source: segment.source,
+          coverOnly: Boolean(meta.coverOnly),
+          file: {
+            token: result.token || id,
+            base64: result.base64,
+            mime: result.mime,
+            fileName: result.fileName || guessFileName(segment.source, "image"),
+            alt: segment.alt || ""
+          },
+          fallbackText: meta.coverOnly ? "" : imageFallbackMarkdown(segment)
+        }
+      });
     };
 
     for (const segment of segments) {
@@ -610,27 +833,16 @@
       if (segment.type === "image") {
         const result = imageResults.get(segment);
         if (result?.ok) {
-          const id = marker("IMAGE");
-          html.push(`<p>${id}</p>`);
-          addBlock("unstyled", id);
-          plan.push({
-            marker: id,
-            op: {
-              type: "image",
-              file: {
-                base64: result.base64,
-                mime: result.mime,
-                fileName: result.fileName,
-                alt: segment.alt || ""
-              },
-              source: segment.source,
-              fallbackText: `[image upload failed: ${segment.alt || result.fileName || "image"}]`
-            }
-          });
+          addImageOperation(segment, result);
         } else {
-          const fallback = `[image unavailable: ${segment.alt || guessFileName(segment.source, "image")}${result?.error ? ` - ${result.error}` : ""}]`;
-          html.push(`<p>${escapeHtml(fallback)}</p>`);
-          addBlock("unstyled", fallback);
+          const fallback = imageFallback(segment);
+          if (fallback.link) {
+            html.push(`<p><a href="${escapeHtml(fallback.link)}">${escapeHtml(fallback.text)}</a></p>`);
+            addBlock("unstyled", fallback.text, { links: [{ offset: 0, length: fallback.text.length, url: fallback.link }] });
+          } else {
+            html.push(`<p>${escapeHtml(fallback.text)}</p>`);
+            addBlock("unstyled", fallback.text);
+          }
         }
         continue;
       }
@@ -660,6 +872,19 @@
           addBlock("code-block", fallback);
         }
       }
+    }
+
+    const coverSource = String(options.coverSource || "").trim();
+    const coverResult = options.coverResult || null;
+    const coverAlreadyInBody = coverSource && segments.some(
+      (segment) => segment.type === "image" && imageSourcesMatch(segment.source, coverSource)
+    );
+    if (coverSource && coverResult?.ok && !coverAlreadyInBody) {
+      addImageOperation(
+        { type: "image", source: coverSource, alt: "cover" },
+        coverResult,
+        { markerType: "COVER", coverOnly: true }
+      );
     }
 
     flushList();
@@ -973,7 +1198,13 @@
     clearVaultHandle,
     ensureReadPermission,
     queryReadPermission,
-    resolveLocalImage
+    resolveLocalImage,
+    imageSourcesMatch,
+    imageFallback,
+    imageFallbackMarkdown,
+    findMarkdownImageSpans,
+    findSpecialBlocks,
+    tableToMarkdown
   };
 
   if (typeof window !== "undefined") {
